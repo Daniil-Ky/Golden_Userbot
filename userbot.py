@@ -370,8 +370,14 @@ async def ask_mineevo(text):
     work_chat = config["mine_work_chat"]
     if work_chat is None:
         raise RuntimeError(".work не настроен")
+
+    # Отправляем команду в сохранённый рабочий чат и ждём именно новое
+    # сообщение после неё. Это важно для автоматической активации промокодов:
+    # результат команды не должен смешиваться со старым ответом MineEVO.
     sent = await client.send_message(work_chat, text)
-    for _ in range(20):
+    logger.info("MineEVO: отправлена команда: %s", text)
+
+    for _ in range(30):
         await asyncio.sleep(0.1)
         messages = await client.get_messages(work_chat, limit=8)
         for msg in messages:
@@ -380,11 +386,16 @@ async def ask_mineevo(text):
             try:
                 sender = await msg.get_sender()
                 if sender is not None and getattr(sender, "bot", False):
+                    logger.info("MineEVO: получен ответ на команду: %s", text)
                     return msg
             except Exception:
                 pass
+            # Если Telegram не дал информацию о sender, всё равно принимаем
+            # первое новое входящее сообщение как ответ рабочему чату.
+            logger.info("MineEVO: получен ответ на команду: %s", text)
             return msg
-    raise TimeoutError("MineEVO не ответил в течение 2 секунд")
+
+    raise TimeoutError("MineEVO не ответил в течение 3 секунд")
 
 
 BASE_PROMO_CODES = {"EVO", "437", "EVO2", "DEV2"}
@@ -425,10 +436,31 @@ async def promo_loop():
                         c for c in codes
                         if c not in BASE_PROMO_CODES and c not in seen
                     ]:
-                        await ask_mineevo(f"промо {code}")
-                        seen.add(code)
-                    config["promo_seen"] = ",".join(sorted(seen))
-                    save_config()
+                        try:
+                            # Сначала реально отправляем промокод и ждём ответ
+                            # MineEVO. Только после успешного ответа запоминаем
+                            # код как обработанный.
+                            response = await ask_mineevo(f"промо {code}")
+                            if response is None:
+                                raise RuntimeError(
+                                    f"MineEVO не вернул ответ для промокода {code}"
+                                )
+                            logger.info(
+                                "Промокод %s отправлен и обработан; ответ: %s",
+                                code,
+                                (response.text or "").replace("\n", " ")[:300],
+                            )
+                            seen.add(code)
+                            config["promo_seen"] = ",".join(sorted(seen))
+                            save_config()
+                            # Небольшая пауза между промокодами, чтобы команды
+                            # не слипались при нескольких новых кодах сразу.
+                            await asyncio.sleep(1)
+                        except Exception:
+                            logger.exception(
+                                "Не удалось отправить/обработать промокод %s",
+                                code,
+                            )
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
             raise
