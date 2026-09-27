@@ -1,4 +1,4 @@
-```This file is part of Golden Userbot.
+`This file is part of Golden Userbot.
 Licensed under the GNU General Public License v3.0.
 
 You may redistribute and/or modify this file under the terms of the
@@ -7,7 +7,7 @@ either version 3 of the License, or (at your option) any later version.
 
 This file is distributed WITHOUT ANY WARRANTY; without even the implied
 warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-See the LICENSE file for the full license text. ```
+See the LICENSE file for the full license text.`
 
 # Golden Userbot 26.3.0
 
