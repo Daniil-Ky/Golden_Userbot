@@ -8,6 +8,7 @@
 # This file is distributed WITHOUT ANY WARRANTY; without even the implied
 # warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 # See the LICENSE file for the full license text.
+
 import os
 import re
 import asyncio
@@ -39,23 +40,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("golden_userbot")
 
-_session_entropy = [
-    229, 205, 206, 198, 199, 204, 130, 247,
-    209, 199, 208, 192, 205, 214, 130, 222,
-    130, 244, 199, 208, 209, 203, 205, 204,
-    152, 130, 144, 148, 140, 145, 140, 146,
-    130, 222, 130, 227, 215, 214, 202, 205,
-    208, 152, 130, 230, 195, 204, 203, 203,
-    206, 130, 233, 140
-]
-
-_sys_hash = 162
-
-def _session_message():
-    return "".join(chr(c ^ _sys_hash) for c in _session_entropy)
-
-logger.info(_session_message())
-
 client = None
 CONFIG_FILE = "userbot_config.txt"
 config = {
@@ -65,7 +49,7 @@ config = {
     "tc_template_chat": None,
     "tc_template_message": None,
     "lm_work_chat": None,
-    "promo_seen": "",
+    "promo_seen": "EVO,437,EVO2,DEV2",
 }
 
 
@@ -364,44 +348,27 @@ async def helper_inline_chosen(request):
         return web.json_response({"ok": False, "error": "bad_request"}, status=400)
 
 
-async def ask_mineevo(text, *, log_label=None, timeout=5.0):
+async def ask_mineevo(text):
     if not text:
         return None
     work_chat = config["mine_work_chat"]
     if work_chat is None:
         raise RuntimeError(".work не настроен")
-
-    label = log_label or text
     sent = await client.send_message(work_chat, text)
-    logger.info("MineEVO: отправлена команда: %s (message_id=%s)", label, sent.id)
-
-    # Ищем только входящее сообщение, появившееся ПОСЛЕ нашей команды.
-    # Раньше функция могла взять первое попавшееся сообщение из последних 8,
-    # из-за чего ответ на другой запрос мог быть принят за ответ MineEVO.
-    attempts = max(1, int(timeout / 0.1))
-    for _ in range(attempts):
+    for _ in range(20):
         await asyncio.sleep(0.1)
-        messages = await client.get_messages(work_chat, limit=12)
+        messages = await client.get_messages(work_chat, limit=8)
         for msg in messages:
             if msg.id <= sent.id or msg.out:
                 continue
             try:
                 sender = await msg.get_sender()
-                if sender is not None and not getattr(sender, "bot", False):
-                    continue
+                if sender is not None and getattr(sender, "bot", False):
+                    return msg
             except Exception:
-                # Если Telegram не дал sender, всё равно принимаем новое
-                # входящее сообщение: это безопаснее, чем терять ответ.
                 pass
-            logger.info(
-                "MineEVO: получен ответ на команду: %s (message_id=%s)",
-                label, msg.id
-            )
             return msg
-
-    raise TimeoutError(
-        f"MineEVO не ответил на команду {label!r} в течение {timeout:g} секунд"
-    )
+    raise TimeoutError("MineEVO не ответил в течение 2 секунд")
 
 
 BASE_PROMO_CODES = {"EVO", "437", "EVO2", "DEV2"}
@@ -438,37 +405,24 @@ async def promo_loop():
                         x.strip() for x in
                         config.get("promo_seen", "").split(",") if x.strip()
                     }
-                    new_codes = [
-                        c for c in sorted(codes)
+                    for code in [
+                        c for c in codes
                         if c not in BASE_PROMO_CODES and c not in seen
-                    ]
-                    logger.info("Promo: обнаружены новые коды: %s", new_codes or "нет")
-
-                    for code in new_codes:
-                        command = f"промо {code}"
-                        try:
-                            response = await ask_mineevo(
-                                command,
-                                log_label=command,
-                                timeout=5.0,
-                            )
-                            if response is None:
-                                raise RuntimeError("MineEVO вернул пустой ответ")
-                            logger.info(
-                                "Promo: код %s успешно отправлен и получен ответ MineEVO (message_id=%s)",
-                                code, response.id
-                            )
+                    ]:
+                        promo_response = await ask_mineevo(f"промо {code}")
+                        promo_text = (promo_response.text or "").strip() if promo_response else ""
+                        expected = f"🎉 Промокод {code} активирован!"
+                        if promo_text == expected:
                             seen.add(code)
                             config["promo_seen"] = ",".join(sorted(seen))
                             save_config()
-                            await asyncio.sleep(0.5)
-                        except Exception:
-                            # Не помечаем код обработанным, если отправка/ответ
-                            # не состоялись. Он будет повторно проверен позже.
-                            logger.exception(
-                                "Promo: не удалось обработать код %s; код НЕ помечен как использованный",
-                                code,
-                            )
+                            logger.info("[PROMO] код %r успешно активирован и добавлен в promo_seen", code)
+                        else:
+                            logger.info("[PROMO] код %r не подтверждён как активированный; в promo_seen не добавлен", code)
+
+                    # Save the current list even when no new code was activated.
+                    config["promo_seen"] = ",".join(sorted(seen))
+                    save_config()
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
             raise
@@ -890,6 +844,54 @@ async def register_handlers():
             "Все функции MineEVO будут использовать этот чат."
         )
         autodelete(msg)
+
+    @client.on(events.NewMessage(
+        outgoing=True, pattern=r"^\.promoseen(?:\s+([+-])([A-Za-z0-9_-]+))?$"
+    ))
+    async def promoseen_handler(event):
+        match = event.pattern_match
+        action = match.group(1)
+        code = match.group(2)
+        seen = {
+            x.strip() for x in config.get("promo_seen", "").split(",")
+            if x.strip()
+        }
+
+        if not action or not code:
+            lines = ["📋 <b>promo_seen:</b>"]
+            if seen:
+                lines.extend(f"<code>{item}</code>" for item in sorted(seen))
+            else:
+                lines.append("<code>пусто</code>")
+            lines.extend([
+                "",
+                "Добавить: <code>.promoseen +КОД</code>",
+                "Удалить: <code>.promoseen -КОД</code>",
+            ])
+            return await answer_and_delete(event, "\n".join(lines))
+
+        if action == "+":
+            if code in seen:
+                return await answer_and_delete(
+                    event, f"⚠️ Код <code>{code}</code> уже находится в <b>promo_seen</b>."
+                )
+            seen.add(code)
+            config["promo_seen"] = ",".join(sorted(seen))
+            save_config()
+            return await answer_and_delete(
+                event, f"✅ Код <code>{code}</code> добавлен в <b>promo_seen</b>."
+            )
+
+        if code not in seen:
+            return await answer_and_delete(
+                event, f"⚠️ Код <code>{code}</code> отсутствует в <b>promo_seen</b>."
+            )
+        seen.remove(code)
+        config["promo_seen"] = ",".join(sorted(seen))
+        save_config()
+        await answer_and_delete(
+            event, f"✅ Код <code>{code}</code> удалён из <b>promo_seen</b>."
+        )
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.thxsource$"))
     async def thxsource_handler(event):
