@@ -1,6 +1,6 @@
 `This file is part of Golden Userbot.
 Licensed under the GNU General Public License v3.0.
-⁠                                     ⁠ 
+⁠                                       ⁠ 
 You may redistribute and/or modify this file under the terms of the
 GNU General Public License as published by the Free Software Foundation,
 either version 3 of the License, or (at your option) any later version.
