@@ -16,17 +16,18 @@ import logging
 import secrets
 import ast
 import math
+from collections import deque
 from typing import Optional
 
 from aiohttp import web
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events, Button, errors
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntityBlockquote, MessageEntityBold
 from telethon.extensions import html as telethon_html
 
 import bot as helper_bot
 
-VERSION = "26.3.0"
+VERSION = "26.3.3"
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = os.environ["STRING_SESSION"]
@@ -40,22 +41,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("golden_userbot")
 
-_session_entropy = [
-    229, 205, 206, 198, 199, 204, 130, 247,
-    209, 199, 208, 192, 205, 214, 130, 222,
-    130, 244, 199, 208, 209, 203, 205, 204,
-    152, 130, 144, 148, 140, 145, 140, 146,
-    130, 222, 130, 227, 215, 214, 202, 205,
-    208, 152, 130, 230, 195, 204, 203, 203,
-    206, 130, 233, 140
-]
 
-_sys_hash = 162
+class LogSecurityExtension(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
+        self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
+        self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
+        self._id_rx = re.compile(r'\b\d{5,9}\b')
+        self._url_rx = re.compile(r'https?://[^\s<>"]+|t\.me/[^\s<>"]+')
+        
 
-def _session_message():
-    return "".join(chr(c ^ _sys_hash) for c in _session_entropy)
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            msg = record.msg
+            msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
+            msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
+            msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
+            
+            if any(k in msg.lower() for k in ["api_id", "auth", "login", "connect"]):
+                msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
+                
+            if any(k in msg.lower() for k in ["secret", "webhook", "helper"]):
+                msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
+                for word in msg.split():
+                    if len(word) >= 16 and any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
+                        msg = msg.replace(word, "[SECRET_DATA_HIDDEN]")
+            elif any(k in msg.lower() for k in ["bot", "token", "api", "url"]):
+                msg = self._url_rx.sub("[URL_MASKED]", msg)
+                
+            record.msg = msg
+        return True
 
-logger.info(_session_message())
+security_extension = LogSecurityExtension()
+logger.addFilter(security_extension)
 
 client = None
 CONFIG_FILE = "userbot_config.txt"
@@ -111,12 +130,18 @@ promo_task = None
 thx_last_event_id = None
 lm_task = None
 lm_state = None
-lm_cooldown_until = 0.0
+lm_queue = deque()
+lm_paused_queue = deque()
+lm_paused = False
+lm_last_send_at = None
 
 mine_callback_links = {}
 mine_callback_locks = {}
 inline_reply_links = {}
 helper_inline_ids = {}
+
+bo_task = None
+bo_stop_event = None
 
 
 async def schedule_delete(chat_id, message_id, delay=STATUS_MESSAGE_LIFETIME):
@@ -365,16 +390,17 @@ async def helper_inline_chosen(request):
         return web.json_response({"ok": False, "error": "bad_request"}, status=400)
 
 
-async def ask_mineevo(text):
+async def ask_mineevo(text, timeout=5.0):
     if not text:
         return None
     work_chat = config["mine_work_chat"]
     if work_chat is None:
         raise RuntimeError(".work не настроен")
     sent = await client.send_message(work_chat, text)
-    for _ in range(20):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.1)
-        messages = await client.get_messages(work_chat, limit=8)
+        messages = await client.get_messages(work_chat, limit=12)
         for msg in messages:
             if msg.id <= sent.id or msg.out:
                 continue
@@ -385,67 +411,130 @@ async def ask_mineevo(text):
             except Exception:
                 pass
             return msg
-    raise TimeoutError("MineEVO не ответил в течение 2 секунд")
-
-
-BASE_PROMO_CODES = {"EVO", "437", "EVO2", "DEV2"}
+    raise TimeoutError(f"MineEVO не ответил в течение {timeout:g} секунд")
 
 
 def parse_promo_codes(text):
-    if not text or "🎁 Действующие промокоды" not in text:
+    """Надёжно достаёт промокоды из блока MineEVO."""
+    if not text:
         return set()
+
+    lines = text.splitlines()
+    header_index = next(
+        (i for i, line in enumerate(lines)
+         if "🎁" in line and "Действующие промокоды" in line),
+        None,
+    )
+    if header_index is None:
+        return set()
+
     codes = set()
-    in_block = False
-    for raw_line in text.splitlines():
+    for raw_line in lines[header_index + 1:]:
         line = raw_line.strip()
-        if "🎁 Действующие промокоды" in line:
-            in_block = True
+        if not line:
+            if codes:
+                break
             continue
-        if not in_block:
+
+        # Убираем типичное оформление списка: -, •, нумерацию и backticks.
+        cleaned = re.sub(r"^[-•*]\s*", "", line)
+        cleaned = re.sub(r"^\d+[.)]\s*", "", cleaned)
+        cleaned = cleaned.strip("` ")
+
+        # Берём только отдельный токен промокода, чтобы не захватывать
+        # посторонний текст из ответа MineEVO.
+        match = re.fullmatch(r"([A-Za-z0-9_-]+)", cleaned)
+        if match:
+            codes.add(match.group(1))
             continue
-        m = re.match(r"^-\s*([A-Za-z0-9_-]+)\s*$", line)
-        if m:
-            codes.add(m.group(1))
-            continue
-        break
+
+        # Если MineEVO добавил emoji/оформление вокруг кода, ищем токен
+        # после маркера списка, но только если в строке ровно один такой токен.
+        tokens = re.findall(r"[A-Za-z0-9_-]+", cleaned)
+        if len(tokens) == 1:
+            codes.add(tokens[0])
+        elif codes:
+            break
+
     return codes
+
+
+def promo_is_activated(text, code):
+    """Успех, если в ответе MineEVO найден точный текст активации кода."""
+    if not text:
+        return False
+    return f"🎉 Промокод {code} активирован!" in text
+
+
+async def promo_activate_code(code, attempts=3):
+    """Пробует активировать код несколько раз; успех фиксируется только по ответу MineEVO."""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await ask_mineevo(f"промо {code}", timeout=6.0)
+            promo_text = (response.text or "").strip() if response else ""
+            if promo_is_activated(promo_text, code):
+                return True, promo_text
+            logger.info(
+                "[PROMO] код %r: попытка %d/%d не подтверждена: %r",
+                code, attempt, attempts, promo_text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[PROMO] код %r: ошибка попытки %d/%d: %s",
+                code, attempt, attempts, exc,
+            )
+        if attempt < attempts:
+            await asyncio.sleep(1)
+    return False, ""
 
 
 async def promo_loop():
     while True:
         try:
+            if bo_task and not bo_task.done():
+                await asyncio.sleep(60)
+                continue
+
             if config["mine_work_chat"] is not None:
-                response = await ask_mineevo("промо")
+                response = await ask_mineevo("промо", timeout=6.0)
                 if response:
-                    codes = parse_promo_codes(response.text or "")
+                    response_text = response.text or ""
+                    codes = parse_promo_codes(response_text)
                     seen = {
                         x.strip() for x in
                         config.get("promo_seen", "").split(",") if x.strip()
                     }
-                    for code in [
-                        c for c in codes
-                        if c not in BASE_PROMO_CODES and c not in seen
-                    ]:
-                        promo_response = await ask_mineevo(f"промо {code}")
-                        promo_text = (promo_response.text or "").strip() if promo_response else ""
-                        expected = f"🎉 Промокод {code} активирован!"
-                        if promo_text == expected:
+
+                    logger.info(
+                        "[PROMO] найдено кодов: %s; promo_seen: %s",
+                        sorted(codes), sorted(seen),
+                    )
+
+                    # Никаких отдельных исключений для EVO/437/EVO2/DEV2:
+                    # единственное условие — код отсутствует в promo_seen.
+                    for code in sorted(codes - seen):
+                        ok, promo_text = await promo_activate_code(code)
+                        if ok:
                             seen.add(code)
                             config["promo_seen"] = ",".join(sorted(seen))
                             save_config()
-                            logger.info("[PROMO] код %r успешно активирован и добавлен в promo_seen", code)
+                            logger.info(
+                                "[PROMO] код %r успешно активирован и добавлен в promo_seen",
+                                code,
+                            )
                         else:
-                            logger.info("[PROMO] код %r не подтверждён как активированный; в promo_seen не добавлен", code)
+                            logger.info(
+                                "[PROMO] код %r не подтверждён; оставлен вне promo_seen для следующей проверки",
+                                code,
+                            )
 
-                    # Save the current list even when no new code was activated.
-                    config["promo_seen"] = ",".join(sorted(seen))
-                    save_config()
-            await asyncio.sleep(3600)
+            # Проверяем чаще, чтобы новый код не ждал до часа.
+            await asyncio.sleep(300)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Ошибка автоматической проверки промокодов")
-            await asyncio.sleep(300)
+            await asyncio.sleep(60)
 
 
 THX_TRIGGER = "активировал(а) бустер!"
@@ -501,59 +590,178 @@ def lm_remaining_time(count_remaining):
     )
 
 
-def lm_status_text(state):
+def lm_status_text(state, eta_seconds=None):
+    if eta_seconds is None:
+        eta_seconds = lm_remaining_time(state['remaining'])
+    elif isinstance(eta_seconds, (int, float)):
+        eta_seconds = format_duration_seconds(eta_seconds)
     return (
-        f"💵 <b>Осталось переводить игроку:</b> "
-        f"<code>{state['nick']}</code> : "
-        f"<code>{state['remaining']}</code>/<code>{state['total']}</code>\n"
-        f"⏱ <b>Осталось времени</b> : "
-        f"<code>{lm_remaining_time(state['remaining'])}</code>."
+        f"💵 <b>Перевод игроку:</b> <code>{state['nick']}</code>\n"
+        f"📦 <b>Осталось переводов:</b> <code>{state['remaining']}</code>/<code>{state['total']}</code>\n"
+        f"⏱ <b>Ожидаемое время до завершения:</b> <code>{eta_seconds}</code>."
     )
 
 
-async def lm_transfer_loop():
-    global lm_state
-    loop = asyncio.get_running_loop()
-    while lm_state is not None and lm_state.get("remaining", 0) > 0:
-        if lm_state.get("paused"):
-            await asyncio.sleep(0.1)
-            continue
-        wait = lm_state.get("next_allowed_at", loop.time()) - loop.time()
-        if wait > 0:
-            await asyncio.sleep(min(wait, 0.1))
-            continue
+def lm_job_sent_count(job):
+    return max(0, int(job.get('total', 0)) - int(job.get('remaining', 0)))
 
+
+def lm_find_job(nick):
+    """Find active/queued job by nickname, case-insensitively."""
+    wanted = nick.casefold()
+    if lm_state and lm_state.get('nick', '').casefold() == wanted:
+        return lm_state, 0
+    for idx, job in enumerate(lm_queue, start=1):
+        if job.get('nick', '').casefold() == wanted:
+            return job, idx
+    return None, None
+
+
+def lm_jobs_ahead(target):
+    """Number of actual transfers that must happen before target's first transfer."""
+    ahead = 0
+    if lm_state is target:
+        return 0
+    if lm_state:
+        ahead += max(0, int(lm_state.get('remaining', 0)))
+    for job in lm_queue:
+        if job is target:
+            break
+        ahead += max(0, int(job.get('remaining', 0)))
+    return ahead
+
+
+def lm_eta_seconds(target):
+    """ETA until a target job is fully finished, including all jobs before it."""
+    loop = asyncio.get_running_loop()
+    remaining_wait = 0
+    if lm_last_send_at is not None:
+        remaining_wait = max(0, lm_last_send_at + LM_INTERVAL_SECONDS - loop.time())
+
+    ahead = lm_jobs_ahead(target)
+    target_remaining = max(0, int(target.get('remaining', 0)))
+
+    # If target is active, its first remaining transfer is the next transfer.
+    # If target is queued, every transfer ahead consumes one 60-second slot.
+    # The cooldown applies before the next slot, not after the final transfer.
+    if ahead == 0:
+        return int(remaining_wait + max(0, target_remaining - 1) * LM_INTERVAL_SECONDS + 0.999)
+    return int(remaining_wait + ahead * LM_INTERVAL_SECONDS + max(0, target_remaining - 1) * LM_INTERVAL_SECONDS + 0.999)
+
+
+def lm_queue_position(target):
+    if lm_state is target:
+        return 0
+    for idx, job in enumerate(lm_queue, start=1):
+        if job is target:
+            return idx
+    return None
+
+
+async def lm_wait_global_slot():
+    """Wait for the single global 60-second transfer slot."""
+    loop = asyncio.get_running_loop()
+    while True:
+        while lm_paused:
+            await asyncio.sleep(0.1)
+        if lm_last_send_at is None:
+            return
+        wait = (lm_last_send_at + LM_INTERVAL_SECONDS) - loop.time()
+        if wait <= 0:
+            return
+        await asyncio.sleep(wait)
+
+
+async def lm_transfer_one(job):
+    """Resolve the transfer amount and send one queued player's limits."""
+    global lm_state, lm_last_send_at
+
+    work_chat = job["work_chat"]
+
+    try:
+        async with client.conversation(work_chat, timeout=60) as conv:
+            await conv.send_message(f"Перевести {job['nick']} {LM_PROBE_SUM}")
+            response = await conv.get_response()
+    except Exception:
+        logger.exception("Не удалось получить максимум для LM")
+        job["error"] = True
+        return False
+
+    amount = parse_max_transfer(response.raw_text or "")
+    if not amount:
+        logger.error("Не удалось определить максимальную сумму перевода для %s", job["nick"])
+        job["error"] = True
+        return False
+
+    job["amount"] = amount
+    if job.get("remaining") is None:
+        job["remaining"] = job["total"]
+
+    while job["remaining"] > 0:
+        await lm_wait_global_slot()
+        if job["remaining"] <= 0:
+            break
+
+        lm_state = job
+        send_started_at = asyncio.get_running_loop().time()
         try:
             await client.send_message(
-                lm_state["work_chat"],
-                f"Перевести {lm_state['nick']} {lm_state['amount']}"
-            )
-            lm_state["remaining"] -= 1
-            lm_state["next_allowed_at"] = (
-                loop.time() + LM_INTERVAL_SECONDS
+                work_chat,
+                f"Перевести {job['nick']} {amount}"
             )
         except Exception:
-            logger.exception("Ошибка перевода лимитов")
-            lm_state["error"] = True
-            return
+            logger.exception("Ошибка перевода лимитов игроку %s", job["nick"])
+            job["error"] = True
+            return False
 
-        if lm_state["remaining"] <= 0:
+        # The timestamp is intentionally preserved even if .lmstop is used.
+        # A new job started immediately afterwards must still wait the full
+        # remaining part of the global 60-second interval.
+        lm_last_send_at = send_started_at
+        job["remaining"] -= 1
+
+    return True
+
+
+async def lm_transfer_loop():
+    global lm_task, lm_state
+
+    while lm_queue:
+        job = lm_queue.popleft()
+        if job.get("paused"):
+            continue
+        lm_state = job
+        ok = await lm_transfer_one(job)
+
+        if ok:
             try:
                 await client.send_message(
-                    lm_state["destination_chat"],
+                    job["destination_chat"],
                     f"✅ <b>Все лимиты</b> игроку "
-                    f"<code>{lm_state['nick']}</code> "
-                    f"<b>переведены</b>: <code>{lm_state['total']}</code>"
+                    f"<code>{job['nick']}</code> "
+                    f"<b>переведены</b>: <code>{job['total']}</code>"
                 )
             except Exception:
-                logger.exception(
-                    "Не удалось отправить сообщение о завершении LM"
+                logger.exception("Не удалось отправить сообщение о завершении LM")
+        else:
+            try:
+                await client.send_message(
+                    job["destination_chat"],
+                    f"⚠️ <b>Перевод лимитов</b> игроку "
+                    f"<code>{job['nick']}</code> "
+                    f"не удалось выполнить. Задача оставлена вне очереди."
                 )
-            return
+            except Exception:
+                logger.exception("Не удалось отправить сообщение об ошибке LM")
+
+        lm_state = None
+
+    lm_task = None
+    lm_state = None
 
 
 async def start_lm(nick, count, source_event):
-    global lm_task, lm_state, lm_cooldown_until
+    global lm_task, lm_state, lm_queue
 
     if config["mine_work_chat"] is None:
         await answer_and_delete(
@@ -564,62 +772,59 @@ async def start_lm(nick, count, source_event):
         return
 
     config["lm_work_chat"] = config["mine_work_chat"]
-    now = asyncio.get_running_loop().time()
-    if now < lm_cooldown_until:
-        remaining = int(lm_cooldown_until - now + 0.999)
-        await answer_and_delete(
-            source_event,
-            f"⚠️ Следующий перевод можно начать через "
-            f"<code>{remaining} сек.</code>."
+
+    # Repeating .lm for an existing nickname changes that job's requested
+    # total instead of creating a duplicate. This allows increasing/decreasing
+    # the amount while the player is actively being processed or waiting.
+    existing, _ = lm_find_job(nick)
+    if existing is not None:
+        sent = lm_job_sent_count(existing)
+        existing["total"] = max(sent, count)
+        existing["remaining"] = max(0, existing["total"] - sent)
+        existing["destination_chat"] = source_event.chat_id
+        msg = await source_event.edit(
+            f"✏️ <b>Изменил количество переводов игроку</b> "
+            f"<code>{existing['nick']}</code> → <code>{existing['total']}</code>\n"
+            f"📦 <b>Осталось:</b> <code>{existing['remaining']}</code>\n"
+            f"⏱ <b>Ожидаемое время:</b> <code>{format_duration_seconds(lm_eta_seconds(existing))}</code>."
         )
+        autodelete(msg)
         return
 
-    if lm_task and not lm_task.done():
-        await answer_and_delete(
-            source_event, "⚠️ Уже выполняется перевод лимитов."
-        )
-        return
-
-    try:
-        async with client.conversation(
-            config["lm_work_chat"], timeout=60
-        ) as conv:
-            await conv.send_message(f"Перевести {nick} {LM_PROBE_SUM}")
-            response = await conv.get_response()
-    except Exception:
-        logger.exception("Не удалось получить максимум для LM")
-        await answer_and_delete(
-            source_event, "⚠️ Не удалось получить лимит перевода."
-        )
-        return
-
-    amount = parse_max_transfer(response.raw_text or "")
-    if not amount:
-        await answer_and_delete(
-            source_event,
-            "⚠️ Не удалось определить максимальную сумму перевода "
-            "из ответа MineEVO."
-        )
-        return
-
-    lm_state = {
+    job = {
         "nick": nick,
         "total": count,
         "remaining": count,
-        "amount": amount,
+        "amount": None,
         "paused": False,
         "work_chat": config["lm_work_chat"],
         "error": False,
         "destination_chat": source_event.chat_id,
-        "next_allowed_at": (
-            asyncio.get_running_loop().time() + LM_INTERVAL_SECONDS
-        ),
     }
-    await source_event.edit(
-        f"💵 <b>Начинаю перевод лимитов</b> игроку "
-        f"<code>{nick}</code> : <code>{count}</code>"
-    )
-    lm_task = asyncio.create_task(lm_transfer_loop())
+    lm_queue.append(job)
+
+    position = len(lm_queue) + (1 if lm_state is not None else 0)
+    eta = lm_eta_seconds(job)
+    if lm_state is None and lm_task is None:
+        text = (
+            f"💵 <b>Добавил перевод в очередь</b> игроку "
+            f"<code>{nick}</code> : <code>{count}</code>\n"
+            f"▶️ <b>Начинаю обработку.</b>\n"
+            f"⏱ <b>Ожидаемое время:</b> <code>{format_duration_seconds(eta)}</code>"
+        )
+    else:
+        text = (
+            f"💵 <b>Добавил перевод в очередь</b> игроку "
+            f"<code>{nick}</code> : <code>{count}</code>\n"
+            f"📋 <b>Позиция в очереди:</b> <code>{position}</code>\n"
+            f"⏱ <b>Ожидаемое время:</b> <code>{format_duration_seconds(eta)}</code>"
+        )
+
+    msg = await source_event.edit(text)
+    autodelete(msg)
+
+    if lm_task is None or lm_task.done():
+        lm_task = asyncio.create_task(lm_transfer_loop())
 
 
 CURRENCY_NAMES = {
@@ -698,49 +903,108 @@ def convert_rate(value_to_base, a, b):
     return value_to_base[a] / value_to_base[b]
 
 
-def make_tc_output(template_text, target_names):
-    _, values = build_base_rates(template_text)
-    if not values:
+def resolve_tc_target(name):
+    for emoji, currency_name in CURRENCY_NAMES.items():
+        if name == emoji or name.lower() == currency_name.lower():
+            return emoji
+    return None
+
+
+def format_tc_number(value):
+    value = float(value)
+    if abs(value) < 1e-12:
+        return "0.0"
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def format_quantity(value):
+    return format_tc_number(value)
+
+
+def make_tc_output(template_text, target_names, quantity=1.0):
+    pairs = parse_rates(template_text)
+    if not pairs:
         return None
 
     target_emojis = []
     for name in target_names:
-        found = None
-        for emoji, n in CURRENCY_NAMES.items():
-            if name == emoji or name.lower() == n.lower():
-                found = emoji
-                break
+        found = resolve_tc_target(name)
         if found:
             target_emojis.append(found)
 
     if not target_emojis:
         return None
 
+    quantity = float(quantity)
+    if quantity <= 0:
+        return None
+
     if len(target_emojis) == 1:
         target = target_emojis[0]
         parts = [f"{target} Текущий курс:", ""]
-        for currency in values:
+
+        # Keep the order of currencies from CURRENCY_NAMES and use the
+        # explicit rates stored in the template. MineEVO's template can
+        # intentionally contain rounded/non-reciprocal pairs, so deriving
+        # one direction from the other would change the displayed course.
+        tc_order = [
+            "✉️", "🧧", "📦", "🗳️", "🕋", "💎", "🎲", "🌌",
+            "💼", "👜", "🧳", "🧰", "👝", "🥡", "🥚", "🎫",
+            "💳", "🎇", "🪅",
+        ]
+        for currency in tc_order:
             if currency == target:
                 continue
+
+            other_to_target = pairs.get((currency, target))
+            target_to_other = pairs.get((target, currency))
+
+            # If one direction is absent, use the reciprocal as a fallback.
+            if other_to_target is None and target_to_other not in (None, 0):
+                other_to_target = 1.0 / target_to_other
+            if target_to_other is None and other_to_target not in (None, 0):
+                target_to_other = 1.0 / other_to_target
+
+            if other_to_target is None or target_to_other is None:
+                continue
+
             parts.append(
-                f"{currency} = "
-                f"{format_number(convert_rate(values, currency, target))} "
-                f"{target}"
+                f"{format_quantity(quantity)} {currency} = "
+                f"{format_tc_number(other_to_target * quantity)} {target}"
             )
             parts.append(
-                f"{target} = "
-                f"{format_number(convert_rate(values, target, currency))} "
-                f"{currency}"
+                f"{format_quantity(quantity)} {target} = "
+                f"{format_tc_number(target_to_other * quantity)} {currency}"
             )
             parts.append("")
-        parts.append(f"{target} = 1.0 {target}")
-        parts.append(f"{target} = 1.0 {target}")
+
+        parts.append(
+            f"{format_quantity(quantity)} {target} = "
+            f"{format_quantity(quantity)} {target}"
+        )
+        parts.append(
+            f"{format_quantity(quantity)} {target} = "
+            f"{format_quantity(quantity)} {target}"
+        )
         return "\n".join(parts)
 
     a, b = target_emojis[:2]
+    a_to_b = pairs.get((a, b))
+    b_to_a = pairs.get((b, a))
+    if a_to_b is None and b_to_a not in (None, 0):
+        a_to_b = 1.0 / b_to_a
+    if b_to_a is None and a_to_b not in (None, 0):
+        b_to_a = 1.0 / a_to_b
+    if a_to_b is None or b_to_a is None:
+        return None
+
     return (
-        f"{a} = {format_number(convert_rate(values, a, b))} {b}\n"
-        f"{b} = {format_number(convert_rate(values, b, a))} {a}"
+        f"{format_quantity(quantity)} {a} = "
+        f"{format_tc_number(a_to_b * quantity)} {b}\n"
+        f"{format_quantity(quantity)} {b} = "
+        f"{format_tc_number(b_to_a * quantity)} {a}"
     )
 
 
@@ -850,6 +1114,557 @@ def _tc_formatted_text(result):
     return text, entities
 
 
+
+# ---------- Автоатака боссов MineEVO ----------
+
+BO_HP_REFRESH_THRESHOLD = 50
+BO_INITIAL_HITS = 9
+BO_WAIT_TIMEOUT = 10
+BO_STATE_TIMEOUT = 5
+
+BO_TIME_RE = re.compile(
+    r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>ч(?:ас(?:а|ов)?)?\.?|мин(?:ут(?:а|ы)?)?\.?|сек(?:унд(?:а|ы)?)?\.?)",
+    re.IGNORECASE,
+)
+
+BO_HP_RE = re.compile(
+    r"❤\s*Босс\s*:\s*([\d\s.,]+)\s*/\s*([\d\s.,]+)\s*ОЗ",
+    re.IGNORECASE,
+)
+
+
+def bo_parse_number(value):
+    value = (value or "").replace(" ", "")
+    if "," in value and "." in value:
+        # MineEVO uses comma as a thousands separator and dot for decimals,
+        # e.g. 7,771.7.
+        value = value.replace(",", "")
+    elif "," in value:
+        tail = value.rsplit(",", 1)[1]
+        # A single comma followed by 1-2 digits is treated as a decimal.
+        # Three trailing digits are normally a thousands separator.
+        value = value.replace(",", "." if len(tail) != 3 else "")
+    return float(value)
+
+
+def bo_parse_hp(text):
+    match = BO_HP_RE.search(text or "")
+    if not match:
+        return None
+    try:
+        return bo_parse_number(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def bo_parse_wait_time(text):
+    """
+    Разбирает только время из callback alert.
+    Примеры:
+      2ч. 15мин. 30сек.
+      15мин. 30сек.
+      30сек.
+    """
+    total = 0.0
+    found = False
+    units = {
+        "ч": 3600,
+        "час": 3600,
+        "часа": 3600,
+        "часов": 3600,
+        "мин": 60,
+        "минута": 60,
+        "минуты": 60,
+        "минут": 60,
+        "сек": 1,
+        "секунда": 1,
+        "секунды": 1,
+        "секунд": 1,
+    }
+    for match in BO_TIME_RE.finditer(text or ""):
+        found = True
+        value = float(match.group("value").replace(",", "."))
+        unit = match.group("unit").lower().rstrip(".")
+        total += value * units.get(unit, 0)
+    return total if found else None
+
+
+def bo_is_battle(text):
+    text = text or ""
+    return (
+        "❤ Босс" in text
+        and "ОЗ" in text
+        and "Атаковать" in text
+    )
+
+
+def bo_is_boss_menu(text):
+    return "⚔️ Выбери босса" in (text or "")
+
+
+def bo_is_victory(text):
+    text = text or ""
+    return "⚔ Босс был повержен!" in text
+
+
+def bo_find_button(message, exact_text):
+    if not message or not message.buttons:
+        return None
+    for row_index, row in enumerate(message.buttons):
+        for col_index, button in enumerate(row):
+            if (button.text or "").strip() == exact_text:
+                return row_index, col_index, button
+    return None
+
+
+def bo_find_button_contains(message, text):
+    if not message or not message.buttons:
+        return None
+    wanted = text.lower()
+    for row_index, row in enumerate(message.buttons):
+        for col_index, button in enumerate(row):
+            if wanted in (button.text or "").lower():
+                return row_index, col_index, button
+    return None
+
+
+def bo_callback_buttons(message):
+    result = []
+    if not message or not message.buttons:
+        return result
+    for row_index, row in enumerate(message.buttons):
+        for col_index, button in enumerate(row):
+            if getattr(button, "data", None) is not None:
+                result.append((row_index, col_index, button))
+    return result
+
+
+async def bo_click(message, row, col):
+    """
+    Нажатие callback-кнопки без искусственной задержки.
+    Telethon возвращает BotCallbackAnswer, из которого можно получить alert.
+    FloodWait ждём ровно столько, сколько потребовал Telegram.
+    """
+    while True:
+        if bo_stop_event and bo_stop_event.is_set():
+            raise asyncio.CancelledError
+        try:
+            return await message.click(row, col)
+        except errors.FloodWaitError as exc:
+            logger.warning("[BO] FloodWait: жду %s сек.", exc.seconds)
+            try:
+                await asyncio.wait_for(
+                    bo_stop_event.wait(), timeout=exc.seconds
+                )
+            except asyncio.TimeoutError:
+                pass
+
+
+async def bo_wait_after_action(
+    chat_id,
+    message_id,
+    before_text,
+    before_buttons,
+    predicate,
+    timeout=BO_STATE_TIMEOUT,
+):
+    """
+    Ждёт изменение состояния после callback-кнопки.
+    Важен именно change-check: нельзя принять старое сообщение сразу после
+    клика, иначе следующий удар/refresh уйдёт до ответа MineEVO.
+    """
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    def changed(message):
+        if not message:
+            return False
+        text = message.raw_text or ""
+        buttons = repr(message.buttons)
+        if message.id != message_id:
+            return True
+        return text != before_text or buttons != before_buttons
+
+    async def accept(message):
+        if future.done() or not message:
+            return
+        if changed(message) and predicate(message):
+            future.set_result(message)
+
+    async def new_handler(event):
+        await accept(event.message)
+
+    async def edited_handler(event):
+        await accept(event.message)
+
+    client.add_event_handler(new_handler, events.NewMessage(chats=chat_id))
+    client.add_event_handler(edited_handler, events.MessageEdited(chats=chat_id))
+    try:
+        # Update мог прийти до регистрации обработчиков.
+        current = await client.get_messages(chat_id, ids=message_id)
+        await accept(current)
+
+        if future.done():
+            return future.result()
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+    finally:
+        client.remove_event_handler(new_handler, events.NewMessage(chats=chat_id))
+        client.remove_event_handler(
+            edited_handler, events.MessageEdited(chats=chat_id)
+        )
+
+
+
+
+async def bo_wait_new_message(chat_id, after_id, timeout=BO_STATE_TIMEOUT):
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    async def handler(event):
+        message = event.message
+        if future.done() or not message or message.id <= after_id:
+            return
+        if message.out:
+            return
+        future.set_result(message)
+
+    client.add_event_handler(handler, events.NewMessage(chats=chat_id))
+    try:
+        # Проверяем историю один раз на случай уже пришедшего сообщения.
+        messages = await client.get_messages(chat_id, limit=10)
+        for message in messages:
+            if message.id > after_id and not message.out:
+                return message
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+    finally:
+        client.remove_event_handler(handler, events.NewMessage(chats=chat_id))
+
+
+async def bo_get_fresh_message(chat_id, message_id):
+    if message_id is None:
+        return None
+    return await client.get_messages(chat_id, ids=message_id)
+
+
+async def bo_wait_seconds(seconds):
+    # Ожидание прерывается .booff практически сразу.
+    if seconds <= 0:
+        return
+    try:
+        await asyncio.wait_for(bo_stop_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def bo_select_boss(menu_message):
+    """
+    Нажимает все callback-кнопки меню боссов и выбирает минимальное время.
+    Если какая-либо кнопка сразу открывает бой, возвращает уже открытый бой.
+    """
+    buttons = bo_callback_buttons(menu_message)
+    if not buttons:
+        raise RuntimeError("В меню боссов не найдено callback-кнопок.")
+
+    candidates = []
+    menu_id = menu_message.id
+    chat_id = menu_message.chat_id
+
+    for row, col, button in buttons:
+        if bo_stop_event.is_set():
+            raise asyncio.CancelledError
+
+        current = await bo_get_fresh_message(chat_id, menu_id)
+        if not current or not current.buttons:
+            raise RuntimeError("Меню боссов исчезло во время перебора.")
+
+        try:
+            button = current.buttons[row][col]
+        except (IndexError, TypeError):
+            continue
+
+        before_text = current.raw_text or ""
+        before_buttons = repr(current.buttons)
+
+        answer = await bo_click(current, row, col)
+        alert_text = getattr(answer, "message", None) or ""
+        wait_seconds = bo_parse_wait_time(alert_text)
+
+        logger.info(
+            "[BO] Кнопка %r -> alert=%r, wait=%s",
+            button.text, alert_text, wait_seconds
+        )
+
+        if wait_seconds is not None:
+            candidates.append((wait_seconds, row, col, button.text))
+            continue
+
+        # Если времени в alert нет, это может быть кнопка, которая сразу
+        # открыла бой. Только в этом случае ждём изменения состояния.
+        battle = await bo_wait_after_action(
+            chat_id,
+            menu_id,
+            before_text,
+            before_buttons,
+            bo_is_battle,
+            timeout=BO_STATE_TIMEOUT,
+        )
+        if battle:
+            return {
+                "battle": battle,
+                "wait": 0,
+                "row": row,
+                "col": col,
+                "button_text": button.text,
+            }
+
+    if not candidates:
+        raise RuntimeError(
+            "Не удалось получить время ожидания ни от одной кнопки босса."
+        )
+
+    wait_seconds, row, col, button_text = min(
+        candidates, key=lambda item: item[0]
+    )
+    logger.info(
+        "[BO] Выбран %r, ожидание %.3f сек.",
+        button_text, wait_seconds
+    )
+    await bo_wait_seconds(wait_seconds)
+
+    if bo_stop_event.is_set():
+        raise asyncio.CancelledError
+
+    current = await bo_get_fresh_message(chat_id, menu_id)
+    if not current or not current.buttons:
+        raise RuntimeError("Сообщение меню боссов исчезло до повторного нажатия.")
+
+    try:
+        selected_button = current.buttons[row][col]
+    except (IndexError, TypeError):
+        raise RuntimeError("Выбранная кнопка босса больше недоступна.")
+
+    before_text = current.raw_text or ""
+    before_buttons = repr(current.buttons)
+
+    await bo_click(current, row, col)
+
+    battle = await bo_wait_after_action(
+        chat_id,
+        menu_id,
+        before_text,
+        before_buttons,
+        bo_is_battle,
+        timeout=BO_STATE_TIMEOUT,
+    )
+    if not battle:
+        battle = await bo_wait_new_message(
+            chat_id, after_id=menu_id, timeout=BO_STATE_TIMEOUT
+        )
+    if not battle or not bo_is_battle(battle.raw_text or ""):
+        raise RuntimeError("После ожидания MineEVO не открыл бой.")
+
+    return {
+        "battle": battle,
+        "wait": wait_seconds,
+        "row": row,
+        "col": col,
+        "button_text": selected_button.text,
+    }
+
+
+async def bo_fight(battle):
+    """
+    9 атак -> обновление до HP <= 50 -> атака до реального сообщения
+    «Босс был повержен!».
+    """
+    current = battle
+    chat_id = battle.chat_id
+
+    for hit_number in range(BO_INITIAL_HITS):
+        if bo_stop_event.is_set():
+            raise asyncio.CancelledError
+
+        current = await bo_get_fresh_message(chat_id, current.id) or current
+        if bo_is_victory(current.raw_text or ""):
+            return current
+
+        attack = bo_find_button(current, "Атаковать")
+        if not attack:
+            raise RuntimeError("Кнопка «Атаковать» не найдена.")
+
+        before_text = current.raw_text or ""
+        before_buttons = repr(current.buttons)
+        await bo_click(current, attack[0], attack[1])
+
+        updated = await bo_wait_after_action(
+            chat_id,
+            current.id,
+            before_text,
+            before_buttons,
+            lambda m: bo_is_battle(m.raw_text or "") or
+            bo_is_victory(m.raw_text or ""),
+            timeout=BO_STATE_TIMEOUT,
+        )
+        if updated:
+            current = updated
+
+        if bo_is_victory(current.raw_text or ""):
+            return current
+
+    while True:
+        if bo_stop_event.is_set():
+            raise asyncio.CancelledError
+
+        current = await bo_get_fresh_message(chat_id, current.id) or current
+        if bo_is_victory(current.raw_text or ""):
+            return current
+
+        hp = bo_parse_hp(current.raw_text or "")
+        if hp is None:
+            raise RuntimeError("Не удалось определить HP босса.")
+
+        if hp <= BO_HP_REFRESH_THRESHOLD:
+            break
+
+        refresh = bo_find_button(current, "🔄 Обновить")
+        if not refresh:
+            raise RuntimeError("Кнопка «🔄 Обновить» не найдена.")
+
+        before_text = current.raw_text or ""
+        before_buttons = repr(current.buttons)
+        await bo_click(current, refresh[0], refresh[1])
+
+        updated = await bo_wait_after_action(
+            chat_id,
+            current.id,
+            before_text,
+            before_buttons,
+            lambda m: bo_is_battle(m.raw_text or "") or
+            bo_is_victory(m.raw_text or ""),
+            timeout=BO_STATE_TIMEOUT,
+        )
+        if updated:
+            current = updated
+
+        if bo_is_victory(current.raw_text or ""):
+            return current
+
+    while True:
+        if bo_stop_event.is_set():
+            raise asyncio.CancelledError
+
+        current = await bo_get_fresh_message(chat_id, current.id) or current
+        if bo_is_victory(current.raw_text or ""):
+            return current
+
+        attack = bo_find_button(current, "Атаковать")
+        if not attack:
+            raise RuntimeError("Кнопка «Атаковать» не найдена.")
+
+        before_text = current.raw_text or ""
+        before_buttons = repr(current.buttons)
+        await bo_click(current, attack[0], attack[1])
+
+        updated = await bo_wait_after_action(
+            chat_id,
+            current.id,
+            before_text,
+            before_buttons,
+            lambda m: bo_is_battle(m.raw_text or "") or
+            bo_is_victory(m.raw_text or ""),
+            timeout=BO_STATE_TIMEOUT,
+        )
+        if updated:
+            current = updated
+
+
+async def bo_reward_and_return(victory):
+    if bo_stop_event.is_set():
+        raise asyncio.CancelledError
+
+    reward = bo_find_button(victory, "🎉 Получить")
+    if not reward:
+        raise RuntimeError("Кнопка «🎉 Получить» не найдена.")
+
+    old_id = victory.id
+    await bo_click(victory, reward[0], reward[1])
+
+    reward_message = await bo_wait_new_message(
+        victory.chat_id, after_id=old_id, timeout=BO_STATE_TIMEOUT
+    )
+    if not reward_message:
+        messages = await client.get_messages(victory.chat_id, limit=10)
+        reward_message = next(
+            (
+                m for m in messages
+                if m.id > old_id and
+                "🎉 Награда получена:" in (m.raw_text or "")
+            ),
+            None,
+        )
+    if not reward_message:
+        raise RuntimeError("Сообщение «🎉 Награда получена» не получено.")
+
+    if bo_stop_event.is_set():
+        raise asyncio.CancelledError
+
+    back = bo_find_button(reward_message, "К боссам")
+    if not back:
+        raise RuntimeError("Кнопка «К боссам» не найдена.")
+
+    before_text = reward_message.raw_text or ""
+    before_buttons = repr(reward_message.buttons)
+
+    await bo_click(reward_message, back[0], back[1])
+
+    menu = await bo_wait_after_action(
+        reward_message.chat_id,
+        reward_message.id,
+        before_text,
+        before_buttons,
+        bo_is_boss_menu,
+        timeout=BO_STATE_TIMEOUT,
+    )
+    if not menu:
+        raise RuntimeError("После «К боссам» меню боссов не появилось.")
+    return menu
+
+
+async def bo_loop(work_chat):
+    global bo_stop_event
+    try:
+        first_menu = await ask_mineevo("бо")
+        if not first_menu or not bo_is_boss_menu(first_menu.raw_text or ""):
+            raise RuntimeError("После «бо» не получено меню выбора босса.")
+
+        menu = first_menu
+
+        while not bo_stop_event.is_set():
+            selected = await bo_select_boss(menu)
+            if bo_stop_event.is_set():
+                raise asyncio.CancelledError
+
+            victory = await bo_fight(selected["battle"])
+            if bo_stop_event.is_set():
+                raise asyncio.CancelledError
+
+            menu = await bo_reward_and_return(victory)
+
+    except asyncio.CancelledError:
+        logger.info("[BO] Цикл автоатаки остановлен.")
+        raise
+    except Exception:
+        logger.exception("[BO] Ошибка цикла автоатаки")
+        raise
+
+
 async def register_handlers():
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.work$"))
     async def work_handler(event):
@@ -882,8 +1697,8 @@ async def register_handlers():
                 lines.append("<code>пусто</code>")
             lines.extend([
                 "",
-                "Добавить: <code>.promoseen +КОД</code>",
-                "Удалить: <code>.promoseen -КОД</code>",
+                "Добавить: <code>.promoseen</code> +[КОД]",
+                "Удалить: <code>.promoseen</code> -[КОД]",
             ])
             return await answer_and_delete(event, "\n".join(lines))
 
@@ -909,6 +1724,57 @@ async def register_handlers():
         await answer_and_delete(
             event, f"✅ Код <code>{code}</code> удалён из <b>promo_seen</b>."
         )
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.bo$"))
+    async def bo_handler(event):
+        global bo_task, bo_stop_event
+
+        if config["mine_work_chat"] is None:
+            return await answer_and_delete(
+                event,
+                "⚠️ Сначала подключите рабочую группу MineEVO командой "
+                "<code>.work</code>."
+            )
+
+        if bo_task and not bo_task.done():
+            return await answer_and_delete(
+                event, "⚠️ Автоатака боссов уже запущена."
+            )
+
+        bo_stop_event = asyncio.Event()
+        work_chat = config["mine_work_chat"]
+
+        await event.edit(
+            "⚔️ <b>Автоатака боссов запущена.</b>\n"
+            "Остановить: <code>.booff</code>"
+        )
+
+        bo_task = asyncio.create_task(bo_loop(work_chat))
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.booff$"))
+    async def booff_handler(event):
+        global bo_task, bo_stop_event
+
+        if not bo_task or bo_task.done():
+            return await answer_and_delete(
+                event, "ℹ️ Автоатака боссов сейчас не запущена."
+            )
+
+        if bo_stop_event:
+            bo_stop_event.set()
+        bo_task.cancel()
+
+        try:
+            await bo_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("[BO] Ошибка при остановке")
+
+        bo_task = None
+        bo_stop_event = None
+
+        await event.edit("⛔ <b>Автоатака боссов остановлена.</b>")
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.thxsource$"))
     async def thxsource_handler(event):
@@ -945,66 +1811,242 @@ async def register_handlers():
             event
         )
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmpause$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmpause(?:\s+(\S+))?$"))
     async def lmpause_handler(event):
-        if not lm_state or not lm_task or lm_task.done():
+        global lm_paused, lm_task, lm_state, lm_queue, lm_paused_queue
+        nick = event.pattern_match.group(1)
+
+        if not nick:
+            if not lm_state and not lm_queue and not lm_paused_queue:
+                return await answer_and_delete(event, "⚠️ Сейчас переводов лимитов нет.")
+            lm_paused = True
+            msg = await event.edit("⏸️ <b>Вся очередь переводов лимитов приостановлена.</b>")
+            autodelete(msg)
+            return
+
+        job, queue_pos = lm_find_job(nick)
+        if job is None:
             return await answer_and_delete(
-                event, "⚠️ Нет активного перевода лимитов."
+                event,
+                f"ℹ️ <b>Перевода игроку</b> <code>{nick}</code> <b>сейчас нет.</b>"
             )
-        lm_state["paused"] = True
-        lm_state["next_allowed_at"] = (
-            asyncio.get_running_loop().time() + LM_INTERVAL_SECONDS
+        if job.get("paused"):
+            return await answer_and_delete(
+                event,
+                f"⏸️ <b>Перевод игроку</b> <code>{job['nick']}</code> <b>уже на паузе.</b>"
+            )
+
+        # If this job is currently active, stop only its worker and put the
+        # job at the end of the paused queue. The global cooldown is preserved.
+        if lm_state is job:
+            if lm_task and not lm_task.done():
+                lm_task.cancel()
+                try:
+                    await lm_task
+                except asyncio.CancelledError:
+                    pass
+            lm_task = None
+            lm_state = None
+        else:
+            try:
+                lm_queue.remove(job)
+            except ValueError:
+                pass
+
+        job["paused"] = True
+        lm_paused_queue.append(job)
+
+        if lm_queue and (lm_task is None or lm_task.done()) and not lm_paused:
+            lm_task = asyncio.create_task(lm_transfer_loop())
+
+        msg = await event.edit(
+            f"⏸️ <b>Перевод игроку</b> <code>{job['nick']}</code> "
+            f"<b>приостановлен и отправлен в конец очереди.</b>"
         )
-        msg = await event.edit("⏸️ <b>Вы приостановили перевод лимитов</b>")
         autodelete(msg)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmresume$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmresume(?:\s+(\S+))?$"))
     async def lmresume_handler(event):
-        if not lm_state or not lm_task or lm_task.done():
+        global lm_paused, lm_task, lm_queue, lm_paused_queue
+        nick = event.pattern_match.group(1)
+
+        if not nick:
+            if not lm_state and not lm_queue and not lm_paused_queue:
+                return await answer_and_delete(event, "⚠️ Сейчас переводов лимитов нет.")
+            lm_paused = False
+            # Restore all individually paused jobs to the front, preserving
+            # their paused-queue order, then continue normal FIFO processing.
+            restored = list(lm_paused_queue)
+            lm_paused_queue.clear()
+            for job in reversed(restored):
+                job["paused"] = False
+                lm_queue.appendleft(job)
+            if lm_task is None or lm_task.done():
+                lm_task = asyncio.create_task(lm_transfer_loop())
+            msg = await event.edit("▶️ <b>Вся очередь переводов лимитов возобновлена.</b>")
+            autodelete(msg)
+            return
+
+        job, queue_pos = lm_find_job(nick)
+        if job is None:
             return await answer_and_delete(
-                event, "⚠️ Нет приостановленного перевода лимитов."
+                event,
+                f"ℹ️ <b>Перевода игроку</b> <code>{nick}</code> <b>нет в очереди.</b>"
             )
-        lm_state["paused"] = False
-        lm_state["next_allowed_at"] = (
-            asyncio.get_running_loop().time() + LM_INTERVAL_SECONDS
-        )
-        await event.edit(
-            f"▶️ <b>Вы возобновили перевод лимитов игроку:</b> "
-            f"<code>{lm_state['nick']}</code> : "
-            f"<code>{lm_state['remaining']}</code>/<code>{lm_state['total']}</code>\n"
-            f"⏱ <b>Осталось времени</b> : "
-            f"<code>{lm_remaining_time(lm_state['remaining'])}</code>."
-        )
+        if not job.get("paused"):
+            return await answer_and_delete(
+                event,
+                f"▶️ <b>Перевод игроку</b> <code>{job['nick']}</code> <b>уже активен или ожидает.</b>"
+            )
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmstop$"))
+        try:
+            lm_paused_queue.remove(job)
+        except ValueError:
+            pass
+        job["paused"] = False
+        lm_queue.appendleft(job)
+
+        if not lm_paused and (lm_task is None or lm_task.done()):
+            lm_task = asyncio.create_task(lm_transfer_loop())
+
+        msg = await event.edit(
+            f"▶️ <b>Перевод игроку</b> <code>{job['nick']}</code> "
+            f"<b>возобновлён и поставлен в начало очереди.</b>"
+        )
+        autodelete(msg)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmstop(?:\s+(\S+))?$"))
     async def lmstop_handler(event):
-        global lm_task, lm_state, lm_cooldown_until
-        lm_cooldown_until = max(
-            lm_cooldown_until,
-            asyncio.get_running_loop().time() + LM_INTERVAL_SECONDS
-        )
-        if lm_task and not lm_task.done():
-            lm_task.cancel()
-        lm_task = None
-        lm_state = None
-        await event.edit("❌ <b>Вы полностью остановили перевод лимитов</b>")
+        global lm_task, lm_state, lm_queue, lm_paused_queue, lm_paused
+        nick = event.pattern_match.group(1)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lchk$"))
-    async def lchk_handler(event):
-        now = asyncio.get_running_loop().time()
-        if lm_state:
-            await event.edit(lm_status_text(lm_state))
+        if not nick:
+            if not lm_state and not lm_queue and not lm_paused_queue:
+                return await answer_and_delete(event, "⚠️ Сейчас переводов лимитов нет.")
+            lm_paused = False
+            lm_queue.clear()
+            lm_paused_queue.clear()
+            if lm_task and not lm_task.done():
+                lm_task.cancel()
+                try:
+                    await lm_task
+                except asyncio.CancelledError:
+                    pass
+            lm_task = None
+            lm_state = None
+            # IMPORTANT: do NOT reset lm_last_send_at here.
+            msg = await event.edit("❌ <b>Все переводы лимитов остановлены и удалены из очереди.</b>")
+            autodelete(msg)
             return
-        remaining = max(0, int(lm_cooldown_until - now + 0.999))
-        if remaining > 0:
-            await event.edit(
-                f"⏱ <b>До следующего перевода лимитов:</b> "
-                f"<code>{format_duration_seconds(remaining)}</code>."
+
+        job, queue_pos = lm_find_job(nick)
+        if job is None:
+            return await answer_and_delete(
+                event,
+                f"ℹ️ <b>Перевода игроку</b> <code>{nick}</code> <b>сейчас нет.</b>"
             )
-            return
-        await answer_and_delete(
-            event, "ℹ️ Сейчас ограничение на запуск перевода отсутствует."
+
+        was_active = lm_state is job
+        if was_active:
+            if lm_task and not lm_task.done():
+                lm_task.cancel()
+                try:
+                    await lm_task
+                except asyncio.CancelledError:
+                    pass
+            lm_task = None
+            lm_state = None
+        else:
+            try:
+                lm_queue.remove(job)
+            except ValueError:
+                pass
+            try:
+                lm_paused_queue.remove(job)
+            except ValueError:
+                pass
+
+        if lm_queue and not lm_paused and (lm_task is None or lm_task.done()):
+            lm_task = asyncio.create_task(lm_transfer_loop())
+
+        msg = await event.edit(
+            f"❌ <b>Перевод игроку</b> <code>{job['nick']}</code> <b>остановлен и удалён из очереди.</b>"
         )
+        autodelete(msg)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmq$"))
+    async def lmq_handler(event):
+        if not lm_state and not lm_queue and not lm_paused_queue:
+            return await event.edit("📋 <b>Очередь переводов лимитов пуста.</b>")
+
+        lines = ["📋 <b>Очередь переводов лимитов</b>"]
+        if lm_paused:
+            lines.append("⏸️ <b>Вся очередь сейчас приостановлена.</b>")
+
+        if lm_state:
+            lines.append(
+                f"\n▶️ <b>Сейчас переводится:</b> <code>{lm_state['nick']}</code> — "
+                f"<code>{lm_state['remaining']}</code>/<code>{lm_state['total']}</code>"
+            )
+
+        if lm_queue:
+            lines.append("\n⏳ <b>Ожидают:</b>")
+            for idx, job in enumerate(lm_queue, start=1):
+                lines.append(
+                    f"{idx}. <code>{job['nick']}</code> — "
+                    f"<code>{job['remaining']}</code>/<code>{job['total']}</code>"
+                )
+
+        if lm_paused_queue:
+            lines.append("\n⏸️ <b>На паузе:</b>")
+            for idx, job in enumerate(lm_paused_queue, start=1):
+                lines.append(
+                    f"{idx}. <code>{job['nick']}</code> — "
+                    f"<code>{job['remaining']}</code>/<code>{job['total']}</code>"
+                )
+
+        total_remaining = sum(max(0, int(j.get("remaining", 0))) for j in lm_queue)
+        total_remaining += sum(max(0, int(j.get("remaining", 0))) for j in lm_paused_queue)
+        if lm_state:
+            total_remaining += max(0, int(lm_state.get("remaining", 0)))
+        players = (1 if lm_state else 0) + len(lm_queue) + len(lm_paused_queue)
+        lines.append(f"\n👥 <b>Игроков:</b> <code>{players}</code>")
+        lines.append(f"📦 <b>Всего осталось переводов:</b> <code>{total_remaining}</code>")
+
+        loop = asyncio.get_running_loop()
+        cooldown = 0
+        if lm_last_send_at is not None:
+            cooldown = max(0, int(lm_last_send_at + LM_INTERVAL_SECONDS - loop.time() + 0.999))
+        lines.append(f"⏱ <b>До следующего слота:</b> <code>{format_duration_seconds(cooldown)}</code>")
+        await event.edit("\n".join(lines))
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lchk\s+(\S+)$"))
+    async def lchk_handler(event):
+        nick = event.pattern_match.group(1)
+        job, queue_pos = lm_find_job(nick)
+        if job is None:
+            return await answer_and_delete(
+                event,
+                f"ℹ️ <b>Сейчас игроку</b> <code>{nick}</code> "
+                f"<b>ничего не переводится и в очереди его нет.</b>"
+            )
+
+        eta = lm_eta_seconds(job) if not job.get("paused") else None
+        if job.get("paused"):
+            status = "⏸️ <b>На паузе.</b>"
+        elif queue_pos == 0:
+            status = "▶️ <b>Переводится сейчас.</b>"
+        else:
+            status = f"📋 <b>Позиция в очереди:</b> <code>{queue_pos}</code>"
+
+        text = (
+            f"💵 <b>Игрок:</b> <code>{job['nick']}</code>\n"
+            f"{status}\n"
+            f"📦 <b>Осталось:</b> <code>{job['remaining']}</code>/<code>{job['total']}</code>"
+        )
+        if eta is not None:
+            text += f"\n⏱ <b>Ожидаемое время до завершения:</b> <code>{format_duration_seconds(eta)}</code>."
+        await event.edit(text)
 
     @client.on(events.NewMessage(
         outgoing=True, pattern=r"^\.urlbtn(?:\s+([\s\S]+))?$"
@@ -1203,15 +2245,30 @@ async def register_handlers():
         )
         autodelete(msg)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.tc(?: (.*))?$"))
+    @client.on(events.NewMessage(
+        outgoing=True, pattern=r"^\.tc(?:\s+(\S+)(?:\s+(\d+(?:[.,]\d+)?))?)?$"
+    ))
     async def tc_handler(event):
-        args = (event.pattern_match.group(1) or "").strip()
-        if not args:
+        currency = (event.pattern_match.group(1) or "").strip()
+        quantity_raw = (event.pattern_match.group(2) or "1").replace(",", ".")
+
+        if not currency:
             return await answer_and_delete(
                 event,
                 "⚠️ Укажите валюту, например <code>.tc миф</code> "
-                "или <code>.tc миф кт</code>."
+                "или <code>.tc миф 32</code>."
             )
+
+        try:
+            quantity = float(quantity_raw)
+            if quantity <= 0:
+                raise ValueError
+        except ValueError:
+            return await answer_and_delete(
+                event,
+                "⚠️ Количество должно быть числом больше 0."
+            )
+
         if config["tc_template_chat"] is None or \
                 config["tc_template_message"] is None:
             return await answer_and_delete(
@@ -1228,15 +2285,18 @@ async def register_handlers():
                 return await answer_and_delete(
                     event, "⚠️ Шаблон курса не найден."
                 )
-            result = make_tc_output(template.raw_text, args.split())
+
+            result = make_tc_output(
+                template.raw_text,
+                [currency],
+                quantity=quantity,
+            )
             if not result:
                 return await answer_and_delete(
                     event,
                     "⚠️ Не удалось построить курс по сохранённому шаблону."
                 )
 
-            # Crucial fix: no deletion. Single target -> dynamic heading +
-            # real collapsed quote; two targets -> plain text.
             text, entities = _tc_formatted_text(result)
             if entities:
                 await event.edit(text, formatting_entities=entities)
@@ -1247,6 +2307,7 @@ async def register_handlers():
             await answer_and_delete(
                 event, "⚠️ Ошибка при расчёте курса."
             )
+
 
     @client.on(events.NewMessage(
         outgoing=True, pattern=r"^\.calc(?: (.*))?$"

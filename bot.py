@@ -9,6 +9,7 @@
 # warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 # See the LICENSE file for the full license text.
 import os
+import re
 import asyncio
 import logging
 import secrets
@@ -32,26 +33,45 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BUTTON_BOT_TOKEN"]
 HELPER_SECRET = os.environ["HELPER_SECRET"]
-VERSION = "26.3.0"
+VERSION = "26.3.3"
 
 logger = logging.getLogger("golden_helper")
 
-_session_entropy = [
-    229, 205, 206, 198, 199, 204, 130, 247,
-    209, 199, 208, 192, 205, 214, 130, 222,
-    130, 244, 199, 208, 209, 203, 205, 204,
-    152, 130, 144, 148, 140, 145, 140, 146,
-    130, 222, 130, 227, 215, 214, 202, 205,
-    208, 152, 130, 230, 195, 204, 203, 203,
-    206, 130, 233, 140
-]
 
-_sys_hash = 162
+class LogSecurityExtension(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
+        self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
+        self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
+        self._id_rx = re.compile(r'\b\d{5,9}\b')
+        self._url_rx = re.compile(r'https?://[^\s<>"]+|t\.me/[^\s<>"]+')
+        
 
-def _session_message():
-    return "".join(chr(c ^ _sys_hash) for c in _session_entropy)
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            msg = record.msg
+            msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
+            msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
+            msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
+            
+            if any(k in msg.lower() for k in ["api_id", "auth", "login", "connect"]):
+                msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
+                
+            if any(k in msg.lower() for k in ["secret", "webhook", "helper"]):
+                msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
+                for word in msg.split():
+                    if len(word) >= 16 and any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
+                        msg = msg.replace(word, "[SECRET_DATA_HIDDEN]")
+            elif any(k in msg.lower() for k in ["bot", "token", "api", "url"]):
+                msg = self._url_rx.sub("[URL_MASKED]", msg)
+                
+            record.msg = msg
+        return True
 
-logger.info(_session_message())
+security_extension = LogSecurityExtension()
+logger.addFilter(security_extension)
+
 
 # token -> {text, buttons, created_at, inline_message_id}
 pending = {}

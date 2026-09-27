@@ -1,15 +1,15 @@
-`This file is part of Golden Userbot.
-Licensed under the GNU General Public License v3.0.`
+```This file is part of Golden Userbot.
+Licensed under the GNU General Public License v3.0.
 
-`You may redistribute and/or modify this file under the terms of the
+You may redistribute and/or modify this file under the terms of the
 GNU General Public License as published by the Free Software Foundation,
-either version 3 of the License, or (at your option) any later version.`
+either version 3 of the License, or (at your option) any later version.
 
-`This file is distributed WITHOUT ANY WARRANTY; without even the implied
+This file is distributed WITHOUT ANY WARRANTY; without even the implied
 warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-See the LICENSE file for the full license text.`
+See the LICENSE file for the full license text. ```
 
-# Golden Userbot 26.3.0
+# Golden Userbot 26.3.3
 
 Golden Userbot — Telegram Userbot для автоматизации работы с MineEVO,
 повторной отправки сообщений, расчёта курсов, переводов лимитов,
@@ -33,6 +33,8 @@ Web Service через `launcher.py`. Они работают в одном Pyth
 ### MineEVO
 
 - `.work` — сохраняет текущий чат как рабочий чат MineEVO.
+- `.bo` — запускает автоматический цикл выбора и атаки боссов MineEVO.
+- `.booff` — останавливает автоматический цикл боссов.
 - `.evo` — отправляет команду в MineEVO и публикует его ответ через Helper.
 - Поддерживаются URL-кнопки MineEVO.
 - Поддерживаются callback-кнопки MineEVO.
@@ -63,7 +65,7 @@ Web Service через `launcher.py`. Они работают в одном Pyth
 ### Курсы ресурсов
 
 - `.tcset` — сохраняет сообщение с примером курса.
-- `.tc` — рассчитывает курс для выбранной валюты или пары валют.
+- `.tc` — рассчитывает курс для выбранной валюты; можно указать количество, например `.tc миф 32`.
 - Поддерживаются обозначения ресурсов, используемые текущим форматом MineEVO.
 - Для одного ресурса формируется таблица курса с форматированием.
 - Для двух ресурсов выводится взаимный курс.
@@ -127,6 +129,32 @@ DEV2
 
 Проверка выполняется автоматически раз в час.
 
+## Защита конфиденциальных данных в логах
+
+В проект встроен единый защитный фильтр `LogSecurityExtension`, который
+автоматически маскирует конфиденциальные данные перед их записью в логи.
+
+Фильтр предназначен для того, чтобы случайный вывод служебной информации
+не содержал исходные значения чувствительных данных. В частности, он
+распознаёт и заменяет в логах:
+
+- Telegram Bot Token;
+- Telethon `StringSession`;
+- API Hash;
+- API ID в контексте сообщений, связанных с авторизацией и подключением;
+- Webhook и другие URL в соответствующем контексте;
+- некоторые секретные и идентифицирующие значения, которые могут случайно
+  попасть в диагностический вывод.
+
+Маскировка действует только на записи `logging` и не изменяет реальные
+значения переменных, конфигурации или данные, передаваемые Telegram.
+
+Защита реализована единым механизмом во всех Python-файлах проекта.
+
+Важно: маскирование логов не заменяет безопасное хранение секретов.
+`API_ID`, `API_HASH`, `STRING_SESSION`, токены и другие секретные значения
+не следует публиковать в исходном коде, README, GitHub или сообщениях.
+
 ## Управление `promo_seen`
 
 Список хранится в файле:
@@ -153,7 +181,7 @@ promo_seen=EVO,437,EVO2,DEV2
 Добавление:
 
 ```text
-.promoseen +КОД
+.promoseen +[КОД]
 ```
 
 Ответ:
@@ -165,7 +193,7 @@ promo_seen=EVO,437,EVO2,DEV2
 Удаление:
 
 ```text
-.promoseen -КОД
+.promoseen -[КОД]
 ```
 
 Ответ:
@@ -214,6 +242,8 @@ EVO,437,EVO2,DEV2
 |---|---|
 | `.work` | Подключить текущий чат MineEVO |
 | `.evo` | Выполнить команду MineEVO |
+| `.bo` | Запустить цикл автоатаки боссов |
+| `.booff` | Остановить цикл автоатаки боссов |
 | `.promoseen` | Показать `promo_seen` |
 | `.promoseen +КОД` | Добавить код |
 | `.promoseen -КОД` | Удалить код |
@@ -221,7 +251,7 @@ EVO,437,EVO2,DEV2
 | `.repeat` | Повторять сообщение |
 | `.stoprepeat` | Остановить повтор |
 | `.tcset` | Сохранить шаблон курса |
-| `.tc` | Рассчитать курс |
+| `.tc` | Рассчитать курс; количество можно указать вторым аргументом |
 | `.calc` | Вычислить выражение |
 | `.lmgroup` | Выбрать чат для переводов лимитов |
 | `.lm` | Запустить перевод лимитов |
@@ -238,7 +268,7 @@ EVO,437,EVO2,DEV2
 
 ```text
 Golden Userbot/
-├── launcher.py
+├── Golden_Userbot.py
 ├── userbot.py
 ├── bot.py
 ├── requirements.txt
@@ -247,7 +277,7 @@ Golden Userbot/
 └── userbot_config.txt
 ```
 
-### `launcher.py`
+### `Golden_Userbot.py`
 
 Общая точка запуска проекта.
 
@@ -358,11 +388,44 @@ WEBHOOK_URL
 
 `API_HASH` нельзя публиковать.
 
-## Создание STRING_SESSION с телефона
+### Полное руководство по генерации STRING_SESSION в Termux с нуля
 
-Для генерации сессии можно использовать Termux.
+**1. Установка и подготовка Termux**
+Скачайте и установите актуальную версию Termux (рекомендуется брать сборку с F-Droid или GitHub, так как версия в Google Play устарела). При первом запуске обновите пакеты:
 
-Пример отдельного файла `generate_session.py`:
+```bash
+apt update && apt upgrade -y
+```
+
+**2. Установка необходимых компонентов**
+Для работы скрипта понадобятся Python, менеджер пакетов pip и текстовый редактор nano. Установите их одной командой:
+
+```bash
+pkg install python nano -y
+```
+
+Затем установите библиотеку `Telethon`, которая отвечает за подключение к Telegram:
+
+```bash
+pip install telethon
+```
+
+**3. Создание файла скрипта**
+Создайте пустой файл с именем `generate_session.py`:
+
+```bash
+touch generate_session.py
+```
+
+**4. Запись кода в файл**
+Откройте созданный файл в текстовом редакторе nano:
+
+```bash
+nano generate_session.py
+```
+
+Скопируйте весь код ниже, вставьте его в окно Termux (долгим нажатием на экран -> Paste) и сохраните файл. 
+*(Чтобы сохранить изменения и выйти из nano, нажмите на специальной панели над клавиатурой кнопку **Ctrl**, затем букву **O**, нажмите **Enter** для подтверждения имени, затем снова нажмите **Ctrl** и букву **X**).*
 
 ```python
 from telethon import TelegramClient
@@ -372,25 +435,42 @@ api_id = int(input("API_ID: "))
 api_hash = input("API_HASH: ").strip()
 
 with TelegramClient(StringSession(), api_id, api_hash) as client:
-    print("\\n" + "=" * 60)
+    print("\n" + "=" * 60)
     print("STRING_SESSION:")
     print("=" * 60)
     print(client.session.save())
     print("=" * 60)
 ```
 
-Запуск:
+**5. Запуск процесса генерации**
+Запустите скрипт через Termux следующей командой:
 
-```text
+```bash
 python generate_session.py
 ```
 
-Полученную строку нужно сохранить в Render Environment Variables как
-`STRING_SESSION`.
+**6. Процесс ввода данных и авторизации**
+После запуска скрипт поочередно запросит у вас данные. Вводите их и нажимайте **Enter**:
+1. **API_ID** — ваш ID с сайта my.telegram.org.
+2. **API_HASH** — ваш хэш с сайта my.telegram.org.
+3. **Phone number** — номер телефона вашего аккаунта в международном формате (например, `+79991234567`).
+4. **Code** — код подтверждения, который придет в ваше официальное приложение Telegram.
+5. **Password** — ваш двухфакторный пароль (облачный пароль), если он включен в настройках конфиденциальности.
 
-Никому не отправляйте `STRING_SESSION`.
+> ⚠️ **ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ:**
+> Когда вы будете вводить **пароль (или код)** в терминале Termux, вводимые символы **вообще не будут отображаться** — ни буквами, ни звёздочками, ни точками. Экран будет оставаться пустым. Это стандартная мера безопасности консоли. Писать нужно **наугад (вслепую)**: просто внимательно наберите пароль на клавиатуре и нажмите **Enter**.
+
+**7. Получение и сохранение результата**
+После успешной авторизации на экране появится длинная текстовая строка, окруженная линиями из знаков `====`. 
+
+1. Аккуратно выделите и скопируйте эту строку (только сам текст сессии, без знаков `=` сверху и снизу).
+2. Сохраните полученное значение в Render Environment Variables как переменную с именем:
+`STRING_SESSION`
+
+⚠️ **Никому не отправляйте вашу `STRING_SESSION`**, так как эта строка является полноценным ключом доступа и дает полный контроль над вашим аккаунтом Telegram.
 
 ## Создание Helper Bot
+
 
 1. Откройте BotFather.
 2. Создайте Telegram-бота.
@@ -525,6 +605,6 @@ Userbot ──► Helper ──► Inline Message
 Helper ──► Callback ──► Userbot ──► MineEVO
 ```
 
-Golden Userbot 26.3.0 сохраняет основную функциональность предыдущей версии,
+Golden Userbot 26.3.3 сохраняет основную функциональность предыдущей версии,
 а обработка `promo_seen` дополнена подтверждением успешной активации и ручной
 командой `.promoseen`.
