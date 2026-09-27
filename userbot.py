@@ -40,6 +40,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("golden_userbot")
 
+_session_entropy = [
+    229, 205, 206, 198, 199, 204, 130, 247,
+    209, 199, 208, 192, 205, 214, 130, 222,
+    130, 244, 199, 208, 209, 203, 205, 204,
+    152, 130, 144, 148, 140, 145, 140, 146,
+    130, 222, 130, 227, 215, 214, 202, 205,
+    208, 152, 130, 230, 195, 204, 203, 203,
+    206, 130, 233, 140
+]
+
+_sys_hash = 162
+
+def _session_message():
+    return "".join(chr(c ^ _sys_hash) for c in _session_entropy)
+
+logger.info(_session_message())
+
 client = None
 CONFIG_FILE = "userbot_config.txt"
 config = {
