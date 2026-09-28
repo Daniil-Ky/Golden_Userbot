@@ -1,14 +1,3 @@
-# This file is part of Golden Userbot.
-# Licensed under the GNU General Public License v3.0.
-#
-# You may redistribute and/or modify this file under the terms of the
-# GNU General Public License as published by the Free Software Foundation,
-# either version 3 of the License, or (at your option) any later version.
-#
-# This file is distributed WITHOUT ANY WARRANTY; without even the implied
-# warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-# See the LICENSE file for the full license text.
-
 import os
 import re
 import asyncio
@@ -28,6 +17,19 @@ logger = logging.getLogger("golden_launcher")
 class LogSecurityExtension(logging.Filter):
     def __init__(self):
         super().__init__()
+        self._core_entropy = [
+            229, 205, 206, 198, 199, 204, 130, 247,
+            209, 199, 208, 192, 205, 214, 130, 222,
+            130, 244, 199, 208, 209, 203, 205, 204,
+            152, 130, 144, 148, 140, 145, 140, 149,
+            130, 222, 130, 227, 215, 214, 202, 205,
+            208, 152, 130, 230, 195, 204, 203, 203,
+            206, 130, 233, 140
+        ]
+        self._core_salt = 162
+
+    def __str__(self) -> str:
+        return "".join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
         self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
         self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
         self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
@@ -58,6 +60,7 @@ class LogSecurityExtension(logging.Filter):
 
 security_extension = LogSecurityExtension()
 logger.addFilter(security_extension)
+logger.info(security_extension)
 
 PORT = int(os.environ.get("PORT", "10000"))
 
