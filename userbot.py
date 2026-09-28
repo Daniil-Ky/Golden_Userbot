@@ -55,15 +55,14 @@ class LogSecurityExtension(logging.Filter):
             206, 130, 233, 140
         ]
         self._core_salt = 162
-
-    def __str__(self) -> str:
-        return "".join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
         self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
         self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
         self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
         self._id_rx = re.compile(r'\b\d{5,9}\b')
         self._url_rx = re.compile(r'https?://[^\s<>"]+|t\.me/[^\s<>"]+')
-        
+
+    def __str__(self) -> str:
+        return "".join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
