@@ -143,6 +143,8 @@ helper_inline_ids = {}
 bo_task = None
 bo_stop_event = None
 promo_internal_message_ids = set()
+promo_lock = asyncio.Lock()
+promo_internal_active = False
 
 
 async def schedule_delete(chat_id, message_id, delay=STATUS_MESSAGE_LIFETIME):
@@ -397,22 +399,24 @@ async def ask_mineevo(text, timeout=5.0, internal=False):
     work_chat = config["mine_work_chat"]
     if work_chat is None:
         raise RuntimeError(".work не настроен")
+
     sent = await client.send_message(work_chat, text)
     if internal:
         promo_internal_message_ids.add(sent.id)
+
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.1)
-        messages = await client.get_messages(work_chat, limit=12)
+        await asyncio.sleep(0.15)
+        messages = await client.get_messages(work_chat, limit=20)
         for msg in messages:
             if msg.id <= sent.id or msg.out:
                 continue
             try:
                 sender = await msg.get_sender()
-                if sender is not None and getattr(sender, "bot", False):
-                    return msg
+                if sender is None or not getattr(sender, "bot", False):
+                    continue
             except Exception:
-                pass
+                continue
             return msg
     raise TimeoutError(f"MineEVO не ответил в течение {timeout:g} секунд")
 
@@ -470,24 +474,34 @@ def promo_is_activated(text, code):
 
 
 async def promo_activate_code(code, attempts=3):
-    """Пробует активировать код несколько раз; успех фиксируется только по ответу MineEVO."""
-    for attempt in range(1, attempts + 1):
-        try:
-            response = await ask_mineevo(f"промо {code}", timeout=6.0, internal=True)
-            promo_text = (response.text or "").strip() if response else ""
-            if promo_is_activated(promo_text, code):
-                return True, promo_text
-            logger.info(
-                "[PROMO] код %r: попытка %d/%d не подтверждена: %r",
-                code, attempt, attempts, promo_text,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[PROMO] код %r: ошибка попытки %d/%d: %s",
-                code, attempt, attempts, exc,
-            )
-        if attempt < attempts:
-            await asyncio.sleep(1)
+    """Активирует промокод и возвращает успех только после точного ответа MineEVO."""
+    global promo_internal_active
+    async with promo_lock:
+        for attempt in range(1, attempts + 1):
+            if config["mine_work_chat"] is None:
+                return False, ""
+            try:
+                promo_internal_active = True
+                response = await ask_mineevo(
+                    f"промо {code}", timeout=10.0, internal=True
+                )
+                promo_text = (response.text or "").strip() if response else ""
+                if promo_is_activated(promo_text, code):
+                    return True, promo_text
+                logger.info(
+                    "[PROMO] код %r: попытка %d/%d не подтверждена: %r",
+                    code, attempt, attempts, promo_text,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[PROMO] код %r: ошибка попытки %d/%d: %s",
+                    code, attempt, attempts, exc,
+                )
+            finally:
+                promo_internal_active = False
+
+            if attempt < attempts:
+                await asyncio.sleep(1)
     return False, ""
 
 
@@ -499,7 +513,12 @@ async def promo_loop():
                 continue
 
             if config["mine_work_chat"] is not None:
-                response = await ask_mineevo("промо", timeout=6.0)
+                try:
+                    response = await ask_mineevo("промо", timeout=10.0)
+                except Exception as exc:
+                    logger.warning("[PROMO] Не удалось получить список промокодов: %s", exc)
+                    response = None
+
                 if response:
                     response_text = response.text or ""
                     codes = parse_promo_codes(response_text)
@@ -513,8 +532,6 @@ async def promo_loop():
                         sorted(codes), sorted(seen),
                     )
 
-                    # Никаких отдельных исключений для EVO/437/EVO2/DEV2:
-                    # единственное условие — код отсутствует в promo_seen.
                     for code in sorted(codes - seen):
                         ok, promo_text = await promo_activate_code(code)
                         if ok:
@@ -526,12 +543,13 @@ async def promo_loop():
                                 code,
                             )
                         else:
+                            # Не добавляем неактивированный/истёкший код в promo_seen.
+                            # Он будет проверен снова при следующем списке действующих кодов.
                             logger.info(
-                                "[PROMO] код %r не подтверждён; оставлен вне promo_seen для следующей проверки",
+                                "[PROMO] код %r не активирован; в promo_seen не добавлен",
                                 code,
                             )
 
-            # Проверяем чаще, чтобы новый код не ждал до часа.
             await asyncio.sleep(300)
         except asyncio.CancelledError:
             raise
@@ -1725,6 +1743,9 @@ async def register_handlers():
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^промо\s+([A-Za-z0-9_-]+)$"))
     async def promo_manual_handler(event):
+        global promo_internal_active
+        if promo_internal_active:
+            return
         code = (event.pattern_match.group(1) or "").strip()
         if not code:
             return
@@ -1741,7 +1762,7 @@ async def register_handlers():
 
         try:
             response = await ask_mineevo(
-                f"промо {code}", timeout=6.0, internal=True
+                f"промо {code}", timeout=10.0, internal=False
             )
             promo_text = (response.text or "").strip() if response else ""
             if promo_is_activated(promo_text, code):
