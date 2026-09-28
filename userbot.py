@@ -142,6 +142,7 @@ helper_inline_ids = {}
 
 bo_task = None
 bo_stop_event = None
+promo_internal_message_ids = set()
 
 
 async def schedule_delete(chat_id, message_id, delay=STATUS_MESSAGE_LIFETIME):
@@ -390,35 +391,22 @@ async def helper_inline_chosen(request):
         return web.json_response({"ok": False, "error": "bad_request"}, status=400)
 
 
-async def ask_mineevo(text, timeout=5.0, predicate=None):
+async def ask_mineevo(text, timeout=5.0, internal=False):
     if not text:
         return None
     work_chat = config["mine_work_chat"]
     if work_chat is None:
         raise RuntimeError(".work не настроен")
     sent = await client.send_message(work_chat, text)
+    if internal:
+        promo_internal_message_ids.add(sent.id)
     deadline = asyncio.get_running_loop().time() + timeout
-    first_response = None
-
     while asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.15)
-        messages = await client.get_messages(work_chat, limit=20)
-
+        await asyncio.sleep(0.1)
+        messages = await client.get_messages(work_chat, limit=12)
         for msg in messages:
             if msg.id <= sent.id or msg.out:
                 continue
-
-            if first_response is None:
-                first_response = msg
-
-            if predicate is not None:
-                try:
-                    if predicate(msg.raw_text or ""):
-                        return msg
-                except Exception:
-                    pass
-                continue
-
             try:
                 sender = await msg.get_sender()
                 if sender is not None and getattr(sender, "bot", False):
@@ -426,10 +414,6 @@ async def ask_mineevo(text, timeout=5.0, predicate=None):
             except Exception:
                 pass
             return msg
-
-    if predicate is not None and first_response is not None:
-        return first_response
-
     raise TimeoutError(f"MineEVO не ответил в течение {timeout:g} секунд")
 
 
@@ -489,7 +473,7 @@ async def promo_activate_code(code, attempts=3):
     """Пробует активировать код несколько раз; успех фиксируется только по ответу MineEVO."""
     for attempt in range(1, attempts + 1):
         try:
-            response = await ask_mineevo(f"промо {code}", timeout=6.0)
+            response = await ask_mineevo(f"промо {code}", timeout=6.0, internal=True)
             promo_text = (response.text or "").strip() if response else ""
             if promo_is_activated(promo_text, code):
                 return True, promo_text
@@ -960,62 +944,45 @@ def make_tc_output(template_text, target_names, quantity=1.0):
     if quantity <= 0:
         return None
 
+    base, values = build_base_rates(template_text)
+    if base is None or not values:
+        return None
+
+    def rate(a, b):
+        if a == b:
+            return 1.0
+        if a not in values or b not in values or values[b] == 0:
+            return None
+        return values[a] / values[b]
+
+    target = target_emojis[0]
+    tc_order = [
+        "✉️", "🧧", "📦", "🗳️", "🕋", "💎", "🎲", "🌌",
+        "💼", "👜", "🧳", "🧰", "👝", "🥡", "🥚", "🎫",
+        "💳", "🎇", "🪅",
+    ]
+
     if len(target_emojis) == 1:
-        target = target_emojis[0]
         parts = [f"{target} Текущий курс:", ""]
-
-        # Keep the order of currencies from CURRENCY_NAMES and use the
-        # explicit rates stored in the template. MineEVO's template can
-        # intentionally contain rounded/non-reciprocal pairs, so deriving
-        # one direction from the other would change the displayed course.
-        tc_order = [
-            "✉️", "🧧", "📦", "🗳️", "🕋", "💎", "🎲", "🌌",
-            "💼", "👜", "🧳", "🧰", "👝", "🥡", "🥚", "🎫",
-            "💳", "🎇", "🪅",
-        ]
         for currency in tc_order:
-            if currency == target:
+            a_to_b = rate(currency, target)
+            b_to_a = rate(target, currency)
+            if a_to_b is None or b_to_a is None:
                 continue
-
-            other_to_target = pairs.get((currency, target))
-            target_to_other = pairs.get((target, currency))
-
-            # If one direction is absent, use the reciprocal as a fallback.
-            if other_to_target is None and target_to_other not in (None, 0):
-                other_to_target = 1.0 / target_to_other
-            if target_to_other is None and other_to_target not in (None, 0):
-                target_to_other = 1.0 / other_to_target
-
-            if other_to_target is None or target_to_other is None:
-                continue
-
             parts.append(
                 f"{format_quantity(quantity)} {currency} = "
-                f"{format_tc_number(other_to_target * quantity)} {target}"
+                f"{format_tc_number(a_to_b * quantity)} {target}"
             )
             parts.append(
                 f"{format_quantity(quantity)} {target} = "
-                f"{format_tc_number(target_to_other * quantity)} {currency}"
+                f"{format_tc_number(b_to_a * quantity)} {currency}"
             )
             parts.append("")
-
-        parts.append(
-            f"{format_quantity(quantity)} {target} = "
-            f"{format_quantity(quantity)} {target}"
-        )
-        parts.append(
-            f"{format_quantity(quantity)} {target} = "
-            f"{format_quantity(quantity)} {target}"
-        )
-        return "\n".join(parts)
+        return "\n".join(parts).rstrip()
 
     a, b = target_emojis[:2]
-    a_to_b = pairs.get((a, b))
-    b_to_a = pairs.get((b, a))
-    if a_to_b is None and b_to_a not in (None, 0):
-        a_to_b = 1.0 / b_to_a
-    if b_to_a is None and a_to_b not in (None, 0):
-        b_to_a = 1.0 / a_to_b
+    a_to_b = rate(a, b)
+    b_to_a = rate(b, a)
     if a_to_b is None or b_to_a is None:
         return None
 
@@ -1218,8 +1185,7 @@ def bo_is_battle(text):
 
 
 def bo_is_boss_menu(text):
-    normalized = normalize_emoji(text or "").lower()
-    return "выбери босса" in normalized
+    return "⚔️ Выбери босса" in (text or "")
 
 
 def bo_is_victory(text):
@@ -1657,25 +1623,67 @@ async def bo_reward_and_return(victory):
     return menu
 
 
-async def bo_loop(work_chat, status_message=None):
+async def bo_get_menu_retry(attempts=3):
+    """
+    Получает актуальное меню боссов. Если старое сообщение удалено/исчезло,
+    заново отправляет «бо» вместо остановки автоатаки.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        if bo_stop_event.is_set():
+            raise asyncio.CancelledError
+
+        try:
+            menu = await ask_mineevo("бо", timeout=BO_WAIT_TIMEOUT)
+            if menu and bo_is_boss_menu(menu.raw_text or ""):
+                return menu
+            last_error = RuntimeError("MineEVO не прислал меню выбора босса.")
+        except (TimeoutError, RuntimeError) as exc:
+            last_error = exc
+
+        if attempt < attempts:
+            logger.warning(
+                "[BO] Меню боссов не найдено (попытка %s/%s), повторяю «бо».",
+                attempt, attempts
+            )
+            await bo_wait_seconds(0.5)
+
+    raise last_error or RuntimeError("Не удалось получить меню боссов.")
+
+
+async def bo_select_boss_retry(menu):
+    """
+    Если сообщение меню было удалено или стало недоступно после ожидания,
+    снова запрашивает «бо» и продолжает автоатаку.
+    """
+    last_error = None
+    for attempt in range(1, 4):
+        if bo_stop_event.is_set():
+            raise asyncio.CancelledError
+
+        try:
+            return await bo_select_boss(menu)
+        except RuntimeError as exc:
+            last_error = exc
+            logger.warning(
+                "[BO] Меню стало недоступно: %s. Отправляю «бо» заново "
+                "(попытка %s/3).",
+                exc, attempt
+            )
+            if attempt >= 3:
+                break
+            menu = await bo_get_menu_retry(attempts=3)
+
+    raise last_error or RuntimeError("Не удалось выбрать босса.")
+
+
+async def bo_loop(work_chat):
     global bo_stop_event
     try:
-        first_menu = await ask_mineevo(
-            "бо",
-            timeout=15.0,
-            predicate=bo_is_boss_menu,
-        )
-        if not first_menu or not bo_is_boss_menu(first_menu.raw_text or ""):
-            response_text = (first_menu.raw_text or "").strip() if first_menu else ""
-            raise RuntimeError(
-                "После «бо» не получено меню выбора босса."
-                + (f" Ответ: {response_text[:300]}" if response_text else "")
-            )
-
-        menu = first_menu
+        menu = await bo_get_menu_retry()
 
         while not bo_stop_event.is_set():
-            selected = await bo_select_boss(menu)
+            selected = await bo_select_boss_retry(menu)
             if bo_stop_event.is_set():
                 raise asyncio.CancelledError
 
@@ -1683,21 +1691,23 @@ async def bo_loop(work_chat, status_message=None):
             if bo_stop_event.is_set():
                 raise asyncio.CancelledError
 
-            menu = await bo_reward_and_return(victory)
+            # После награды меню обычно возвращается через «К боссам».
+            # Если сообщение исчезло, bo_reward_and_return() выбросит ошибку;
+            # вместо остановки заново отправляем «бо».
+            try:
+                menu = await bo_reward_and_return(victory)
+            except RuntimeError as exc:
+                logger.warning(
+                    "[BO] Не удалось вернуть меню боссов: %s. "
+                    "Запрашиваю меню через «бо».", exc
+                )
+                menu = await bo_get_menu_retry()
 
     except asyncio.CancelledError:
         logger.info("[BO] Цикл автоатаки остановлен.")
         raise
-    except Exception as exc:
+    except Exception:
         logger.exception("[BO] Ошибка цикла автоатаки")
-        if status_message is not None:
-            try:
-                await status_message.edit(
-                    "⚠️ <b>Автоатака боссов остановлена.</b>\n"
-                    f"<b>Причина:</b> <code>{str(exc)[:350]}</code>"
-                )
-            except Exception:
-                logger.exception("[BO] Не удалось показать ошибку в Telegram")
         raise
 
 
@@ -1712,6 +1722,51 @@ async def register_handlers():
             "Все функции MineEVO будут использовать этот чат."
         )
         autodelete(msg)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^промо\s+([A-Za-z0-9_-]+)$"))
+    async def promo_manual_handler(event):
+        code = (event.pattern_match.group(1) or "").strip()
+        if not code:
+            return
+        if event.id in promo_internal_message_ids:
+            promo_internal_message_ids.discard(event.id)
+            return
+
+        if config["mine_work_chat"] is None:
+            return await answer_and_delete(
+                event,
+                "⚠️ Сначала подключите рабочую группу MineEVO командой "
+                "<code>.work</code>."
+            )
+
+        try:
+            response = await ask_mineevo(
+                f"промо {code}", timeout=6.0, internal=True
+            )
+            promo_text = (response.text or "").strip() if response else ""
+            if promo_is_activated(promo_text, code):
+                seen = {
+                    x.strip() for x in config.get("promo_seen", "").split(",")
+                    if x.strip()
+                }
+                seen.add(code)
+                config["promo_seen"] = ",".join(sorted(seen))
+                save_config()
+                return await answer_and_delete(
+                    event, f"🎉 Промокод <code>{code}</code> активирован."
+                )
+
+            return await answer_and_delete(
+                event,
+                f"⚠️ MineEVO не подтвердил активацию промокода "
+                f"<code>{code}</code>."
+            )
+        except Exception as exc:
+            logger.exception("Ошибка ручной активации промокода %r", code)
+            return await answer_and_delete(
+                event, f"⚠️ Не удалось активировать промокод <code>{code}</code>: "
+                f"{type(exc).__name__}."
+            )
 
     @client.on(events.NewMessage(
         outgoing=True, pattern=r"^\.promoseen(?:\s+([+-])([A-Za-z0-9_-]+))?$"
@@ -1780,13 +1835,12 @@ async def register_handlers():
         bo_stop_event = asyncio.Event()
         work_chat = config["mine_work_chat"]
 
-        status_message = await event.edit(
+        await event.edit(
             "⚔️ <b>Автоатака боссов запущена.</b>\n"
-            "⏳ <b>Ожидаю меню боссов от MineEVO...</b>\n"
             "Остановить: <code>.booff</code>"
         )
 
-        bo_task = asyncio.create_task(bo_loop(work_chat, status_message))
+        bo_task = asyncio.create_task(bo_loop(work_chat))
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.booff$"))
     async def booff_handler(event):
@@ -2062,8 +2116,7 @@ async def register_handlers():
         nick = event.pattern_match.group(1)
         if not nick:
             return await answer_and_delete(
-                event,
-                "🔎 <b>Использование:</b> <code>.lchk [ник]</code>"
+                event, "🔎 <b>Использование:</b> <code>.lchk [ник]</code>"
             )
         job, queue_pos = lm_find_job(nick)
         if job is None:
@@ -2288,11 +2341,13 @@ async def register_handlers():
         autodelete(msg)
 
     @client.on(events.NewMessage(
-        outgoing=True, pattern=r"^\.tc(?:\s+(\S+)(?:\s+(\d+(?:[.,]\d+)?))?)?$"
+        outgoing=True,
+        pattern=r"^\.tc(?:\s+(\S+)(?:\s+(\d+(?:[.,]\d+)?))?(?:\s+(\S+))?)?$"
     ))
     async def tc_handler(event):
         currency = (event.pattern_match.group(1) or "").strip()
         quantity_raw = (event.pattern_match.group(2) or "1").replace(",", ".")
+        target_currency = (event.pattern_match.group(3) or "").strip()
 
         if not currency:
             return await answer_and_delete(
@@ -2328,9 +2383,13 @@ async def register_handlers():
                     event, "⚠️ Шаблон курса не найден."
                 )
 
+            targets = [currency]
+            if target_currency:
+                targets.append(target_currency)
+
             result = make_tc_output(
                 template.raw_text,
-                [currency],
+                targets,
                 quantity=quantity,
             )
             if not result:
