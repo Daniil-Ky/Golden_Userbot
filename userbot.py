@@ -390,7 +390,7 @@ async def helper_inline_chosen(request):
         return web.json_response({"ok": False, "error": "bad_request"}, status=400)
 
 
-async def ask_mineevo(text, timeout=5.0):
+async def ask_mineevo(text, timeout=5.0, predicate=None):
     if not text:
         return None
     work_chat = config["mine_work_chat"]
@@ -398,12 +398,27 @@ async def ask_mineevo(text, timeout=5.0):
         raise RuntimeError(".work не настроен")
     sent = await client.send_message(work_chat, text)
     deadline = asyncio.get_running_loop().time() + timeout
+    first_response = None
+
     while asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.1)
-        messages = await client.get_messages(work_chat, limit=12)
+        await asyncio.sleep(0.15)
+        messages = await client.get_messages(work_chat, limit=20)
+
         for msg in messages:
             if msg.id <= sent.id or msg.out:
                 continue
+
+            if first_response is None:
+                first_response = msg
+
+            if predicate is not None:
+                try:
+                    if predicate(msg.raw_text or ""):
+                        return msg
+                except Exception:
+                    pass
+                continue
+
             try:
                 sender = await msg.get_sender()
                 if sender is not None and getattr(sender, "bot", False):
@@ -411,6 +426,10 @@ async def ask_mineevo(text, timeout=5.0):
             except Exception:
                 pass
             return msg
+
+    if predicate is not None and first_response is not None:
+        return first_response
+
     raise TimeoutError(f"MineEVO не ответил в течение {timeout:g} секунд")
 
 
@@ -1199,7 +1218,8 @@ def bo_is_battle(text):
 
 
 def bo_is_boss_menu(text):
-    return "⚔️ Выбери босса" in (text or "")
+    normalized = normalize_emoji(text or "").lower()
+    return "выбери босса" in normalized
 
 
 def bo_is_victory(text):
@@ -1637,12 +1657,20 @@ async def bo_reward_and_return(victory):
     return menu
 
 
-async def bo_loop(work_chat):
+async def bo_loop(work_chat, status_message=None):
     global bo_stop_event
     try:
-        first_menu = await ask_mineevo("бо")
+        first_menu = await ask_mineevo(
+            "бо",
+            timeout=15.0,
+            predicate=bo_is_boss_menu,
+        )
         if not first_menu or not bo_is_boss_menu(first_menu.raw_text or ""):
-            raise RuntimeError("После «бо» не получено меню выбора босса.")
+            response_text = (first_menu.raw_text or "").strip() if first_menu else ""
+            raise RuntimeError(
+                "После «бо» не получено меню выбора босса."
+                + (f" Ответ: {response_text[:300]}" if response_text else "")
+            )
 
         menu = first_menu
 
@@ -1660,8 +1688,16 @@ async def bo_loop(work_chat):
     except asyncio.CancelledError:
         logger.info("[BO] Цикл автоатаки остановлен.")
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception("[BO] Ошибка цикла автоатаки")
+        if status_message is not None:
+            try:
+                await status_message.edit(
+                    "⚠️ <b>Автоатака боссов остановлена.</b>\n"
+                    f"<b>Причина:</b> <code>{str(exc)[:350]}</code>"
+                )
+            except Exception:
+                logger.exception("[BO] Не удалось показать ошибку в Telegram")
         raise
 
 
@@ -1744,12 +1780,13 @@ async def register_handlers():
         bo_stop_event = asyncio.Event()
         work_chat = config["mine_work_chat"]
 
-        await event.edit(
+        status_message = await event.edit(
             "⚔️ <b>Автоатака боссов запущена.</b>\n"
+            "⏳ <b>Ожидаю меню боссов от MineEVO...</b>\n"
             "Остановить: <code>.booff</code>"
         )
 
-        bo_task = asyncio.create_task(bo_loop(work_chat))
+        bo_task = asyncio.create_task(bo_loop(work_chat, status_message))
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.booff$"))
     async def booff_handler(event):
@@ -2020,9 +2057,14 @@ async def register_handlers():
         lines.append(f"⏱ <b>До следующего слота:</b> <code>{format_duration_seconds(cooldown)}</code>")
         await event.edit("\n".join(lines))
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lchk\s+(\S+)$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lchk(?:\s+(\S+))?$"))
     async def lchk_handler(event):
         nick = event.pattern_match.group(1)
+        if not nick:
+            return await answer_and_delete(
+                event,
+                "🔎 <b>Использование:</b> <code>.lchk [ник]</code>"
+            )
         job, queue_pos = lm_find_job(nick)
         if job is None:
             return await answer_and_delete(

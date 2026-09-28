@@ -381,7 +381,7 @@ WEBHOOK_URL
 
 ## Получение API_ID и API_HASH
 
-1. Откройте Telegram API development tools.
+1. Откройте сайт my.telegram.org 
 2. Войдите в свой Telegram-аккаунт.
 3. Создайте приложение, если его ещё нет.
 4. Сохраните `API_ID` и `API_HASH`.
