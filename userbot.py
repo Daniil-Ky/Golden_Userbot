@@ -137,7 +137,7 @@ def save_config():
 
 load_config()
 
-STATUS_MESSAGE_LIFETIME = 180
+STATUS_MESSAGE_LIFETIME = 60
 active_tasks = {}
 promo_task = None
 thx_last_event_id = None
@@ -413,25 +413,74 @@ async def ask_mineevo(text, timeout=5.0, internal=False):
     if work_chat is None:
         raise RuntimeError(".work не настроен")
 
-    sent = await client.send_message(work_chat, text)
-    if internal:
-        promo_internal_message_ids.add(sent.id)
-
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.15)
-        messages = await client.get_messages(work_chat, limit=20)
-        for msg in messages:
-            if msg.id <= sent.id or msg.out:
+    # MineEVO can either send a new reply or edit an existing bot message.
+    # Remember existing bot-message IDs before sending the command so an
+    # edited old menu can be recognised without accepting unrelated edits.
+    baseline_bot_ids = set()
+    try:
+        baseline = await client.get_messages(work_chat, limit=20)
+        for msg in baseline:
+            if msg.out:
                 continue
             try:
                 sender = await msg.get_sender()
-                if sender is None or not getattr(sender, "bot", False):
-                    continue
+                if sender is not None and getattr(sender, "bot", False):
+                    baseline_bot_ids.add(msg.id)
             except Exception:
                 continue
-            return msg
-    raise TimeoutError(f"MineEVO не ответил в течение {timeout:g} секунд")
+    except Exception:
+        baseline = []
+
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    async def accept(message):
+        if future.done() or not message or message.out:
+            return
+        try:
+            sender = await message.get_sender()
+            if sender is None or not getattr(sender, "bot", False):
+                return
+        except Exception:
+            return
+        # New bot replies must be newer than our command. Edited replies may
+        # reuse an older message ID, but only if that ID existed in the
+        # baseline snapshot taken immediately before the command.
+        if message.id > sent.id or message.id in baseline_bot_ids:
+            future.set_result(message)
+
+    async def new_handler(event):
+        await accept(event.message)
+
+    async def edited_handler(event):
+        await accept(event.message)
+
+    client.add_event_handler(new_handler, events.NewMessage(chats=work_chat))
+    client.add_event_handler(edited_handler, events.MessageEdited(chats=work_chat))
+    try:
+        sent = await client.send_message(work_chat, text)
+        if internal:
+            promo_internal_message_ids.add(sent.id)
+
+        # The event handler is registered before sending, so a very fast
+        # MineEVO response cannot be missed. Also check history once in case
+        # Telegram delivered the update before the handler ran.
+        try:
+            messages = await client.get_messages(work_chat, limit=20)
+            for msg in messages:
+                await accept(msg)
+                if future.done():
+                    return future.result()
+        except Exception:
+            pass
+
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"MineEVO не ответил в течение {timeout:g} секунд")
+    finally:
+        client.remove_event_handler(new_handler, events.NewMessage(chats=work_chat))
+        client.remove_event_handler(edited_handler, events.MessageEdited(chats=work_chat))
 
 
 def parse_promo_codes(text):
@@ -480,10 +529,10 @@ def parse_promo_codes(text):
 
 
 def promo_is_activated(text, code):
-    """Успех, если в ответе MineEVO найден точный текст активации кода."""
+    """Успех только при точном ответе MineEVO об активации кода."""
     if not text:
         return False
-    return f"🎉 Промокод {code} активирован!" in text
+    return text.strip() == f"🎉 Промокод {code} активирован!"
 
 
 async def promo_activate_code(code, attempts=3):
@@ -2228,9 +2277,9 @@ async def register_handlers():
         else:
             return await answer_and_delete(
                 event,
-                "<b>Формат 1:</b> <code>.repeat текст количество интервал_в_минутах</code>\n"
+                "<b>Формат 1:</b> <code>.repeat текст количество интервал_в_секундах</code>\n"
                 "<b>Формат 2:</b> reply на сообщение + "
-                "<code>.repeat количество интервал_в_минутах</code>"
+                "<code>.repeat количество интервал_в_секундах</code>"
             )
 
         if not count_str.isdigit() or int(count_str) <= 0:
@@ -2239,8 +2288,8 @@ async def register_handlers():
                 "⚠️ <b>Количество</b> должно быть целым числом больше 0."
             )
         try:
-            interval_minutes = float(interval_str.replace(",", "."))
-            if interval_minutes < 0:
+            interval_seconds = float(interval_str.replace(",", "."))
+            if interval_seconds < 0:
                 raise ValueError
         except ValueError:
             return await answer_and_delete(
@@ -2254,7 +2303,7 @@ async def register_handlers():
         active_tasks[chat_id] = {"stop": False}
         status = await event.edit(
             f"🚀 <b>Запущено:</b> {count} повторов, "
-            f"интервал {interval_minutes} мин.\n"
+            f"интервал {interval_seconds} сек.\n"
             f"Остановить: <code>.stoprepeat</code>"
         )
         autodelete(status)
@@ -2284,7 +2333,7 @@ async def register_handlers():
                     await client.send_message(chat_id, text)
                 sent += 1
                 if sent < count:
-                    await asyncio.sleep(interval_minutes * 60)
+                    await asyncio.sleep(interval_seconds)
             if sent == count:
                 msg = await client.send_message(
                     chat_id, f"✅ <b>Готово:</b> отправлено {sent}/{count}."
