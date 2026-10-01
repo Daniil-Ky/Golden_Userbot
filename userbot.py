@@ -155,10 +155,14 @@ helper_inline_ids = {}
 
 bo_task = None
 bo_stop_event = None
-promo_internal_message_ids = set()
 ask_mineevo_lock = asyncio.Lock()
 promo_lock = asyncio.Lock()
-promo_internal_active = False
+# MineEVO rejects callback presses made too close together.  This limiter
+# is shared by .bo and .evo so every button press for MineEVO is separated
+# by at least one second.
+MINE_BUTTON_INTERVAL = 1.0
+mine_button_lock = asyncio.Lock()
+mine_last_button_at = 0.0
 
 
 async def schedule_delete(chat_id, message_id, delay=STATUS_MESSAGE_LIFETIME):
@@ -368,6 +372,20 @@ async def update_helper_inline_message(response, link, inline_message_id):
         }
 
 
+async def _mine_click_with_limit(message, row, col):
+    """Нажимает кнопку MineEVO не чаще одного раза в секунду."""
+    global mine_last_button_at
+    async with mine_button_lock:
+        loop = asyncio.get_running_loop()
+        wait = MINE_BUTTON_INTERVAL - (loop.time() - mine_last_button_at)
+        if wait > 0:
+            logger.info("[MINE] Жду %.2f сек. перед следующим нажатием кнопки", wait)
+            await asyncio.sleep(wait)
+        result = await message.click(row, col)
+        mine_last_button_at = loop.time()
+        return result
+
+
 async def refresh_mineevo_callback(callback_id, inline_message_id=None):
     link = mine_callback_links.get(callback_id)
     if not link:
@@ -386,7 +404,7 @@ async def refresh_mineevo_callback(callback_id, inline_message_id=None):
 
         before_text = source.raw_text or ""
         before_buttons = repr(source.buttons)
-        await source.click(link["row"], link["col"])
+        await _mine_click_with_limit(source, link["row"], link["col"])
 
         updated = None
         for _ in range(20):
@@ -452,29 +470,25 @@ async def helper_inline_chosen(request):
         return web.json_response({"ok": False, "error": "bad_request"}, status=400)
 
 
-async def ask_mineevo(text, timeout=5.0, internal=False):
-    """Отправляет запрос MineEVO и сериализует ожидание ответа.
+async def ask_mineevo(text, timeout=5.0, internal=False, chat_id=None):
+    """Отправляет запрос MineEVO и ждёт именно его ответ.
 
-    Все запросы к одному рабочему чату проходят через один lock, поэтому
-    promo/.bo/.evo не могут одновременно перехватить ответы друг друга.
-    В первую очередь принимается сообщение-ответ на отправленный запрос.
+    chat_id позволяет тем же механизмом работать как в рабочей группе,
+    так и в личке MineEVO во время боя.
     """
     if not text:
         return None
-    work_chat = config["mine_work_chat"]
-    if work_chat is None:
+    target_chat = config["mine_work_chat"] if chat_id is None else chat_id
+    if target_chat is None:
         raise RuntimeError(".work не настроен")
 
     async with ask_mineevo_lock:
-        sent = await client.send_message(work_chat, text)
-        if internal:
-            promo_internal_message_ids.add(sent.id)
-
-        logger.info("[MINE] отправлено: %r (message_id=%s)", text, sent.id)
+        sent = await client.send_message(target_chat, text)
+        logger.info("[MINE] отправлено: %r (chat=%s, message_id=%s)", text, target_chat, sent.id)
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.20)
-            messages = await client.get_messages(work_chat, limit=30)
+            messages = await client.get_messages(target_chat, limit=30)
             after = []
             for msg in messages:
                 if msg.id <= sent.id or msg.out:
@@ -542,23 +556,68 @@ def parse_promo_codes(text):
 
 
 def promo_is_activated(text, code):
-    """Успех только при точном ответе MineEVO для данного кода."""
+    """Считает код активированным по подтверждению MineEVO."""
     if not text:
         return False
-    return text.strip() == f"🎉 Промокод {code} активирован!"
+    return f"🎉 Промокод {code} активирован" in text
+
+
+async def promo_send_and_wait(code, timeout=15.0):
+    """Обычным текстовым сообщением отправляет «промо CODE» в Work.
+
+    Ответ ищется после ID именно этого сообщения. Если MineEVO оформил ответ
+    как reply, он имеет приоритет; иначе берётся самое новое сообщение бота,
+    пришедшее после отправки. Никаких специальных callback/inline-механизмов
+    для отправки промокода здесь нет.
+    """
+    chat_id = config["mine_work_chat"]
+    if chat_id is None:
+        raise RuntimeError(".work не настроен")
+
+    text = f"промо {code}"
+    sent = await client.send_message(chat_id, text)
+    logger.info(
+        "[PROMO] отправлено обычным текстом в Work: %r (message_id=%s)",
+        text, sent.id,
+    )
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.20)
+        messages = await client.get_messages(chat_id, limit=30)
+        after = []
+        for msg in messages:
+            if msg.id <= sent.id or msg.out:
+                continue
+            try:
+                sender = await msg.get_sender()
+                if sender is None or not getattr(sender, "bot", False):
+                    continue
+            except Exception:
+                continue
+            after.append(msg)
+
+        if not after:
+            continue
+
+        for msg in after:
+            reply = getattr(msg, "reply_to", None)
+            if getattr(reply, "reply_to_msg_id", None) == sent.id:
+                return msg
+
+        return max(after, key=lambda m: m.id)
+
+    raise TimeoutError(f"MineEVO не ответил на «{text}» в течение {timeout:g} секунд")
 
 
 async def promo_activate_code(code, attempts=3):
-    """Отправляет промо-код и принимает его только после подтверждения MineEVO."""
+    """Отправляет промо-код обычным текстом и ждёт ответ MineEVO."""
     async with promo_lock:
         for attempt in range(1, attempts + 1):
             if config["mine_work_chat"] is None:
                 return False, ""
             try:
-                logger.info("[PROMO] отправляю 'промо %s'", code)
-                response = await ask_mineevo(
-                    f"промо {code}", timeout=15.0, internal=True
-                )
+                response = await promo_send_and_wait(code, timeout=15.0)
                 promo_text = (response.text or "").strip() if response else ""
                 logger.info("[PROMO] код %r: ответ MineEVO: %r", code, promo_text)
                 if promo_is_activated(promo_text, code):
@@ -1192,8 +1251,8 @@ def _tc_formatted_text(result):
 
 # ---------- Автоатака боссов MineEVO ----------
 
-BO_HP_REFRESH_THRESHOLD = 50
-BO_INITIAL_HITS = 9
+BO_HP_REFRESH_THRESHOLD = 100
+BO_INITIAL_HITS = 10
 BO_WAIT_TIMEOUT = 10
 BO_STATE_TIMEOUT = 5
 
@@ -1268,6 +1327,15 @@ def bo_extract_wait_seconds(*texts):
     return None
 
 
+def bo_is_rate_limit_alert(text):
+    text = (text or "").lower()
+    return (
+        "слишком быстро" in text
+        or "не так быстро" in text
+        or "подожди" in text and "сек" in text
+    )
+
+
 def bo_is_battle(text):
     text = (text or "").lower().replace("️", "")
     return "босс" in text and "оз" in text and "атак" in text
@@ -1322,7 +1390,7 @@ async def bo_click(message, row, col):
     if bo_stop_event and bo_stop_event.is_set():
         raise asyncio.CancelledError
     try:
-        answer = await message.click(row, col)
+        answer = await _mine_click_with_limit(message, row, col)
         alert_text = (
             getattr(answer, "message", None)
             or getattr(answer, "alert", None)
@@ -1449,9 +1517,11 @@ async def bo_wait_seconds(seconds):
 
 
 async def bo_select_boss(menu_message):
-    """
-    Нажимает все callback-кнопки меню боссов и выбирает минимальное время.
-    Если какая-либо кнопка сразу открывает бой, возвращает уже открытый бой.
+    """Проверяет таймеры всех боссов в рабочей группе.
+
+    Здесь мы только собираем таймеры. Сам бой никогда не запускаем в Work:
+    после выбора минимального таймера его кнопка и название запоминаются,
+    затем по истечении времени бой начинается в личке MineEVO.
     """
     buttons = bo_callback_buttons(menu_message)
     if not buttons:
@@ -1467,125 +1537,156 @@ async def bo_select_boss(menu_message):
 
         current = await bo_get_fresh_message(chat_id, menu_id)
         if not current or not current.buttons:
-            raise RuntimeError("Меню боссов исчезло во время перебора.")
+            raise RuntimeError("Меню боссов исчезло во время проверки таймеров.")
 
         try:
-            button = current.buttons[row][col]
+            current_button = current.buttons[row][col]
         except (IndexError, TypeError):
             continue
 
         before_text = current.raw_text or ""
         before_buttons = repr(current.buttons)
-
         answer, alert_text = await bo_click(current, row, col)
-        wait_seconds = bo_extract_wait_seconds(alert_text)
+        if bo_is_rate_limit_alert(alert_text):
+            wait_seconds = bo_extract_wait_seconds(alert_text) or MINE_BUTTON_INTERVAL
+            logger.warning(
+                "[BO] MineEVO отклонил нажатие как слишком быстрое; "
+                "жду %.2f сек. и повторю эту кнопку.", wait_seconds
+            )
+            await bo_wait_seconds(wait_seconds)
+            current = await bo_get_fresh_message(chat_id, menu_id)
+            if not current or not current.buttons:
+                continue
+            try:
+                current_button = current.buttons[row][col]
+            except (IndexError, TypeError):
+                continue
+            before_text = current.raw_text or ""
+            before_buttons = repr(current.buttons)
+            _, alert_text = await bo_click(current, row, col)
 
+        wait_seconds = bo_extract_wait_seconds(alert_text)
         logger.info(
-            "[BO] Кнопка %r -> alert=%r, wait=%s",
-            button.text, alert_text, wait_seconds
+            "[BO] Таймер кнопки %r -> alert=%r, wait=%s",
+            current_button.text, alert_text, wait_seconds,
         )
 
-        if wait_seconds is not None:
-            candidates.append((wait_seconds, row, col, button.text))
+        if bo_is_rate_limit_alert(alert_text):
+            logger.warning("[BO] Повторное слишком быстрое нажатие; кнопку пропускаю до следующего цикла.")
             continue
 
-        # MineEVO может не показывать alert, а отредактировать меню или
-        # прислать новое сообщение с таймером. Ждём изменение и проверяем
-        # одновременно таймер и бой.
+        if wait_seconds is not None:
+            candidates.append((max(0.0, wait_seconds), row, col, current_button.text))
+            continue
+
         changed = await bo_wait_after_action(
             chat_id, menu_id, before_text, before_buttons,
-            lambda m: bo_is_battle(m.raw_text or "") or bo_parse_wait_time(m.raw_text or "") is not None,
+            lambda m: bo_parse_wait_time(m.raw_text or "") is not None
+            or bo_is_battle(m.raw_text or ""),
             timeout=BO_STATE_TIMEOUT,
         )
         if changed:
             changed_wait = bo_parse_wait_time(changed.raw_text or "")
             if changed_wait is not None:
-                candidates.append((changed_wait, row, col, button.text))
+                candidates.append((max(0.0, changed_wait), row, col, current_button.text))
                 continue
             if bo_is_battle(changed.raw_text or ""):
-                return {"battle": changed, "wait": 0, "row": row, "col": col, "button_text": button.text}
+                # Если MineEVO открыл бой прямо в Work, это означает, что
+                # таймер уже истёк. Сохраняем нулевой таймер; следующий цикл
+                # будет пытаться открыть тот же босс в личке.
+                candidates.append((0.0, row, col, current_button.text))
+                continue
 
-        battle = await bo_wait_after_action(
-            chat_id,
-            menu_id,
-            before_text,
-            before_buttons,
-            bo_is_battle,
-            timeout=BO_STATE_TIMEOUT,
+        logger.warning(
+            "[BO] Не удалось получить таймер кнопки %r; пропускаю.",
+            current_button.text,
         )
-        if battle:
-            return {
-                "battle": battle,
-                "wait": 0,
-                "row": row,
-                "col": col,
-                "button_text": button.text,
-            }
 
     if not candidates:
-        raise RuntimeError(
-            "Не удалось получить время ожидания ни от одной кнопки босса."
-        )
+        raise RuntimeError("Не удалось получить время ожидания ни от одной кнопки босса.")
 
-    wait_seconds, row, col, button_text = min(
-        candidates, key=lambda item: item[0]
-    )
+    wait_seconds, row, col, button_text = min(candidates, key=lambda item: item[0])
     logger.info(
-        "[BO] Выбран %r, ожидание %.3f сек.",
-        button_text, wait_seconds
+        "[BO] Выбран босс %r: ждать %.3f сек.; Work row=%s col=%s",
+        button_text, wait_seconds, row, col,
     )
-    await bo_wait_seconds(wait_seconds)
+    return {
+        "wait": wait_seconds,
+        "row": row,
+        "col": col,
+        "button_text": button_text,
+    }
 
-    if bo_stop_event.is_set():
-        raise asyncio.CancelledError
 
-    current = await bo_get_fresh_message(chat_id, menu_id)
-    if not current or not current.buttons:
-        raise RuntimeError("Сообщение меню боссов исчезло до повторного нажатия.")
-
+async def bo_get_private_chat():
+    """Возвращает личный чат с MineEVO."""
     try:
-        selected_button = current.buttons[row][col]
-    except (IndexError, TypeError):
-        raise RuntimeError("Выбранная кнопка босса больше недоступна.")
+        return await client.get_entity(THX_BOT)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Не удалось открыть личный чат MineEVO ({THX_BOT}): {type(exc).__name__}."
+        ) from exc
 
-    before_text = current.raw_text or ""
-    before_buttons = repr(current.buttons)
 
-    _, _ = await bo_click(current, row, col)
+async def bo_start_private_fight(selected):
+    """Открывает меню боссов в личке MineEVO и выбирает нужного босса."""
+    private_chat = await bo_get_private_chat()
+    menu = await bo_get_menu_retry(chat_id=private_chat, attempts=3)
+
+    wanted = (selected.get("button_text") or "").strip()
+    button = bo_find_button(menu, wanted) if wanted else None
+    if not button and wanted:
+        button = bo_find_button_contains(menu, wanted)
+    if not button:
+        # Запасной вариант: если порядок кнопок одинаковый, используем
+        # сохранённые координаты.
+        row, col = selected["row"], selected["col"]
+        try:
+            candidate = menu.buttons[row][col]
+            button = (row, col, candidate)
+        except (IndexError, TypeError):
+            button = None
+    if not button:
+        raise RuntimeError(f"В личке не найдена кнопка босса «{wanted}».")
+
+    row, col, selected_button = button
+    before_text = menu.raw_text or ""
+    before_buttons = repr(menu.buttons)
+    await bo_click(menu, row, col)
 
     battle = await bo_wait_after_action(
-        chat_id,
-        menu_id,
+        menu.chat_id,
+        menu.id,
         before_text,
         before_buttons,
-        bo_is_battle,
+        lambda m: bo_is_battle(m.raw_text or "")
+        or bo_find_button_contains(m, "атаковать") is not None,
         timeout=BO_STATE_TIMEOUT,
     )
     if not battle:
         battle = await bo_wait_new_message(
-            chat_id, after_id=menu_id, timeout=BO_STATE_TIMEOUT
+            menu.chat_id, after_id=menu.id, timeout=BO_STATE_TIMEOUT
         )
-    if not battle or not bo_is_battle(battle.raw_text or ""):
-        raise RuntimeError("После ожидания MineEVO не открыл бой.")
+    if not battle or not (
+        bo_is_battle(battle.raw_text or "")
+        or bo_find_button_contains(battle, "атаковать") is not None
+    ):
+        raise RuntimeError("После выбора босса в личке MineEVO не открылся бой.")
 
-    return {
-        "battle": battle,
-        "wait": wait_seconds,
-        "row": row,
-        "col": col,
-        "button_text": selected_button.text,
-    }
+    logger.info("[BO] Бой открыт в личке MineEVO: %r", selected_button.text)
+    return battle
 
 
 async def bo_fight(battle):
-    """Полный бой по реальному сообщению MineEVO.
+    """Проводит бой в личке MineEVO.
 
-    После каждого клика не предполагаем, что бой уже обновился: сначала
-    ждём изменение сообщения/результат callback, затем заново читаем кнопки.
-    Это не даёт старой механике застревать после одного «Атаковать».
+    Первые 10 ударов выполняются последовательно. После этого бот не
+    спамит атаками: обновляет состояние боя и ждёт, пока HP босса станет
+    небольшим, затем добивает его обычной атакой.
     """
     current = battle
     chat_id = battle.chat_id
+    attack_count = 0
 
     while not bo_stop_event.is_set():
         current = await bo_get_fresh_message(chat_id, current.id) or current
@@ -1594,75 +1695,20 @@ async def bo_fight(battle):
         if bo_is_victory(text):
             return current
 
-        # Если MineEVO поменял сообщение боя, но оно ещё не прошло строгий
-        # parser, наличие кнопки атаки всё равно является достаточным признаком.
         attack = bo_find_button_contains(current, "атаковать")
         if not attack:
-            # Иногда после callback сообщение редактируется с небольшой
-            # задержкой. Даём ему время и повторно читаем его.
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.5)
             current = await bo_get_fresh_message(chat_id, current.id) or current
             text = current.raw_text or ""
             if bo_is_victory(text):
                 return current
             attack = bo_find_button_contains(current, "атаковать")
 
-        if attack:
-            before_text = current.raw_text or ""
-            before_buttons = repr(current.buttons)
-            _, alert_text = await bo_click(current, attack[0], attack[1])
-
-            wait_seconds = bo_extract_wait_seconds(alert_text)
-            if wait_seconds is not None and wait_seconds > 0:
-                logger.info("[BO] после атаки MineEVO дал таймер: %.3f сек.", wait_seconds)
-                await bo_wait_seconds(wait_seconds)
-                continue
-
-            updated = await bo_wait_after_action(
-                chat_id,
-                current.id,
-                before_text,
-                before_buttons,
-                lambda m: bool(
-                    bo_is_battle(m.raw_text or "")
-                    or bo_is_victory(m.raw_text or "")
-                    or bo_find_button_contains(m, "атаковать")
-                ),
-                timeout=BO_STATE_TIMEOUT,
-            )
-            if updated:
-                current = updated
-                continue
-
-            # Не считаем отсутствие события поражением/зависанием. Проверяем
-            # актуальное сообщение ещё раз перед повторной попыткой.
-            refreshed = await bo_get_fresh_message(chat_id, current.id)
-            if refreshed:
-                if bo_is_victory(refreshed.raw_text or ""):
-                    return refreshed
-                if bo_find_button_contains(refreshed, "атаковать"):
-                    current = refreshed
-                    continue
-
-            # Возможно, MineEVO создал новое сообщение боя.
-            newer = await bo_wait_new_message(
-                chat_id, after_id=current.id, timeout=1.5
-            )
-            if newer and (bo_is_battle(newer.raw_text or "") or
-                          bo_is_victory(newer.raw_text or "") or
-                          bo_find_button_contains(newer, "атаковать")):
-                current = newer
-                continue
-
-            logger.warning("[BO] После атаки не получено новое состояние боя; повторяю чтение.")
-            await asyncio.sleep(0.5)
-            continue
-
-        # Если кнопки атаки нет, проверяем HP и кнопку обновления — это
-        # соответствует механике образца: сначала обновляем состояние боя,
-        # затем принимаем решение о следующей атаке.
         hp = bo_parse_hp(text)
-        if hp is not None and hp > BO_HP_REFRESH_THRESHOLD:
+
+        # После первых 10 ударов только обновляем бой, пока HP не станет
+        # маленьким. Кнопка «Обновить» тоже проходит общий лимит 1 сек.
+        if attack_count >= BO_INITIAL_HITS and hp is not None and hp > BO_HP_REFRESH_THRESHOLD:
             refresh = bo_find_button_contains(current, "обнов")
             if refresh:
                 before_text = current.raw_text or ""
@@ -1672,32 +1718,89 @@ async def bo_fight(battle):
                 if wait_seconds is not None and wait_seconds > 0:
                     await bo_wait_seconds(wait_seconds)
                     continue
+
                 updated = await bo_wait_after_action(
                     chat_id, current.id, before_text, before_buttons,
-                    lambda m: bo_is_battle(m.raw_text or "") or
-                    bo_is_victory(m.raw_text or "") or
-                    bo_find_button_contains(m, "атаковать"),
+                    lambda m: bo_is_battle(m.raw_text or "")
+                    or bo_is_victory(m.raw_text or "")
+                    or bo_find_button_contains(m, "атаковать") is not None,
                     timeout=BO_STATE_TIMEOUT,
                 )
                 if updated:
                     current = updated
                     continue
 
-        # Сообщение могло быть удалено/заменено. Ищем новое состояние боя,
-        # вместо того чтобы завершать цикл после единственной неудачи.
+                refreshed = await bo_get_fresh_message(chat_id, current.id)
+                if refreshed:
+                    current = refreshed
+                await asyncio.sleep(0.2)
+                continue
+
+        if not attack:
+            newer = await bo_wait_new_message(chat_id, current.id, timeout=1.5)
+            if newer and (
+                bo_is_battle(newer.raw_text or "")
+                or bo_is_victory(newer.raw_text or "")
+                or bo_find_button_contains(newer, "атаковать") is not None
+            ):
+                current = newer
+                continue
+            await asyncio.sleep(0.5)
+            continue
+
+        before_text = current.raw_text or ""
+        before_buttons = repr(current.buttons)
+        _, alert_text = await bo_click(current, attack[0], attack[1])
+        if bo_is_rate_limit_alert(alert_text):
+            wait_seconds = bo_extract_wait_seconds(alert_text) or MINE_BUTTON_INTERVAL
+            logger.warning("[BO] Атака отклонена из-за интервала; жду %.2f сек.", wait_seconds)
+            await bo_wait_seconds(wait_seconds)
+            continue
+
+        attack_count += 1
+        logger.info("[BO] Удар %s/%s", min(attack_count, BO_INITIAL_HITS), BO_INITIAL_HITS)
+
+        wait_seconds = bo_extract_wait_seconds(alert_text)
+        if wait_seconds is not None and wait_seconds > 0:
+            await bo_wait_seconds(wait_seconds)
+
+        updated = await bo_wait_after_action(
+            chat_id,
+            current.id,
+            before_text,
+            before_buttons,
+            lambda m: bo_is_battle(m.raw_text or "")
+            or bo_is_victory(m.raw_text or "")
+            or bo_find_button_contains(m, "атаковать") is not None,
+            timeout=BO_STATE_TIMEOUT,
+        )
+        if updated:
+            current = updated
+            continue
+
+        refreshed = await bo_get_fresh_message(chat_id, current.id)
+        if refreshed:
+            if bo_is_victory(refreshed.raw_text or ""):
+                return refreshed
+            current = refreshed
+            continue
+
         newer = await bo_wait_new_message(chat_id, current.id, timeout=1.5)
-        if newer and (bo_is_battle(newer.raw_text or "") or
-                      bo_is_victory(newer.raw_text or "") or
-                      bo_find_button_contains(newer, "атаковать")):
+        if newer and (
+            bo_is_battle(newer.raw_text or "")
+            or bo_is_victory(newer.raw_text or "")
+            or bo_find_button_contains(newer, "атаковать") is not None
+        ):
             current = newer
             continue
 
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(0.5)
 
     raise asyncio.CancelledError
 
 
 async def bo_reward_and_return(victory):
+    """Забирает награду в личке; после этого следующий цикл идёт в Work."""
     if bo_stop_event.is_set():
         raise asyncio.CancelledError
 
@@ -1706,61 +1809,43 @@ async def bo_reward_and_return(victory):
         raise RuntimeError("Кнопка «🎉 Получить» не найдена.")
 
     old_id = victory.id
+    before_text = victory.raw_text or ""
+    before_buttons = repr(victory.buttons)
     await bo_click(victory, reward[0], reward[1])
 
-    reward_message = await bo_wait_new_message(
-        victory.chat_id, after_id=old_id, timeout=BO_STATE_TIMEOUT
-    )
-    if not reward_message:
-        messages = await client.get_messages(victory.chat_id, limit=10)
-        reward_message = next(
-            (
-                m for m in messages
-                if m.id > old_id and
-                "🎉 Награда получена:" in (m.raw_text or "")
-            ),
-            None,
-        )
-    if not reward_message:
-        raise RuntimeError("Сообщение «🎉 Награда получена» не получено.")
-
-    if bo_stop_event.is_set():
-        raise asyncio.CancelledError
-
-    back = bo_find_button_contains(reward_message, "к боссам")
-    if not back:
-        raise RuntimeError("Кнопка «К боссам» не найдена.")
-
-    before_text = reward_message.raw_text or ""
-    before_buttons = repr(reward_message.buttons)
-
-    await bo_click(reward_message, back[0], back[1])
-
-    menu = await bo_wait_after_action(
-        reward_message.chat_id,
-        reward_message.id,
+    # MineEVO может создать отдельное сообщение или отредактировать текущее.
+    reward_message = await bo_wait_after_action(
+        victory.chat_id,
+        victory.id,
         before_text,
         before_buttons,
-        bo_is_boss_menu,
+        lambda m: "награда получена" in (m.raw_text or "").lower(),
         timeout=BO_STATE_TIMEOUT,
     )
-    if not menu:
-        raise RuntimeError("После «К боссам» меню боссов не появилось.")
-    return menu
+    if not reward_message:
+        reward_message = await bo_wait_new_message(
+            victory.chat_id, after_id=old_id, timeout=2.0
+        )
+
+    if reward_message:
+        logger.info("[BO] Награда получена в личке MineEVO.")
+    else:
+        # Сам callback уже был принят MineEVO. Не останавливаем весь цикл,
+        # если подтверждение пришло в виде alert, а не сообщения.
+        logger.warning("[BO] Подтверждение награды не найдено; продолжаю цикл.")
+
+    return reward_message
 
 
-async def bo_get_menu_retry(attempts=3):
-    """
-    Получает актуальное меню боссов. Если старое сообщение удалено/исчезло,
-    заново отправляет «бо» вместо остановки автоатаки.
-    """
+async def bo_get_menu_retry(chat_id=None, attempts=3):
+    """Получает меню боссов в указанном чате, соблюдая паузу между запросами."""
     last_error = None
     for attempt in range(1, attempts + 1):
         if bo_stop_event.is_set():
             raise asyncio.CancelledError
 
         try:
-            menu = await ask_mineevo("бо", timeout=BO_WAIT_TIMEOUT)
+            menu = await ask_mineevo("бо", timeout=BO_WAIT_TIMEOUT, chat_id=chat_id)
             raw = menu.raw_text if menu else ""
             if menu and bo_is_boss_menu(raw):
                 return menu
@@ -1808,28 +1893,32 @@ async def bo_select_boss_retry(menu):
 async def bo_loop(work_chat):
     global bo_stop_event
     try:
-        menu = await bo_get_menu_retry()
-
+        # Work используется только для проверки таймеров.
         while not bo_stop_event.is_set():
+            menu = await bo_get_menu_retry(chat_id=work_chat)
             selected = await bo_select_boss_retry(menu)
             if bo_stop_event.is_set():
                 raise asyncio.CancelledError
 
-            victory = await bo_fight(selected["battle"])
+            await bo_wait_seconds(selected["wait"])
             if bo_stop_event.is_set():
                 raise asyncio.CancelledError
 
-            # После награды меню обычно возвращается через «К боссам».
-            # Если сообщение исчезло, bo_reward_and_return() выбросит ошибку;
-            # вместо остановки заново отправляем «бо».
+            # Таймер закончился — переносим сам бой в личку MineEVO.
+            battle = await bo_start_private_fight(selected)
+            victory = await bo_fight(battle)
+            if bo_stop_event.is_set():
+                raise asyncio.CancelledError
+
+            # Забираем награду в личке. После этого цикл снова возвращается
+            # в Work и заново проверяет все таймеры.
             try:
-                menu = await bo_reward_and_return(victory)
+                await bo_reward_and_return(victory)
             except RuntimeError as exc:
                 logger.warning(
-                    "[BO] Не удалось вернуть меню боссов: %s. "
-                    "Запрашиваю меню через «бо».", exc
+                    "[BO] Не удалось завершить возврат после награды: %s. "
+                    "Следующий цикл начнётся через Work.", exc
                 )
-                menu = await bo_get_menu_retry()
 
     except asyncio.CancelledError:
         logger.info("[BO] Цикл автоатаки остановлен.")
@@ -1850,51 +1939,6 @@ async def register_handlers():
             "Все функции MineEVO будут использовать этот чат."
         )
         autodelete(msg)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.?промо\s+([A-Za-z0-9_-]+)$"))
-    async def promo_manual_handler(event):
-        code = (event.pattern_match.group(1) or "").strip()
-        if not code:
-            return
-        if event.id in promo_internal_message_ids:
-            promo_internal_message_ids.discard(event.id)
-            return
-
-        if config["mine_work_chat"] is None:
-            return await answer_and_delete(
-                event,
-                "⚠️ Сначала подключите рабочую группу MineEVO командой "
-                "<code>.work</code>."
-            )
-
-        try:
-            response = await ask_mineevo(
-                f"промо {code}", timeout=10.0, internal=False
-            )
-            promo_text = (response.text or "").strip() if response else ""
-            if promo_is_activated(promo_text, code):
-                seen = {
-                    x.strip() for x in config.get("promo_seen", "").split(",")
-                    if x.strip()
-                }
-                seen.add(code)
-                config["promo_seen"] = ",".join(sorted(seen))
-                save_config()
-                return await answer_and_delete(
-                    event, f"🎉 Промокод <code>{code}</code> активирован."
-                )
-
-            return await answer_and_delete(
-                event,
-                f"⚠️ MineEVO не подтвердил активацию промокода "
-                f"<code>{code}</code>."
-            )
-        except Exception as exc:
-            logger.exception("Ошибка ручной активации промокода %r", code)
-            return await answer_and_delete(
-                event, f"⚠️ Не удалось активировать промокод <code>{code}</code>: "
-                f"{type(exc).__name__}."
-            )
 
     @client.on(events.NewMessage(
         outgoing=True, pattern=r"^\.promoseen(?:\s+([+-])([A-Za-z0-9_-]+))?$"
