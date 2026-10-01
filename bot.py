@@ -20,6 +20,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    MessageEntity,
     Update,
 )
 from telegram.constants import ParseMode
@@ -160,11 +161,12 @@ async def update_helper(data):
     pending[token]["inline_message_id"] = inline_message_id
 
     text = pending[token]["text"] or "\u200b"
+    entities = [MessageEntity(**item) for item in pending[token].get("entities", [])]
     markup = make_keyboard(token, pending[token]["buttons"])
     await _application.bot.edit_message_text(
         inline_message_id=inline_message_id,
         text=text,
-        parse_mode=ParseMode.HTML,
+        entities=entities or None,
         reply_markup=markup,
     )
     return {"ok": True}
@@ -180,6 +182,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = data.get("text", "") or "\u200b"
+    entities = [MessageEntity(**item) for item in data.get("entities", [])]
     markup = make_keyboard(token, data.get("buttons", []))
     result = InlineQueryResultArticle(
         id=token,
@@ -187,7 +190,7 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         description="Отправить результат",
         input_message_content=InputTextMessageContent(
             message_text=text,
-            parse_mode=ParseMode.HTML,
+            entities=entities or None,
         ),
         reply_markup=markup,
     )
