@@ -132,6 +132,7 @@ async def prepare_helper(data):
     token = secrets.token_urlsafe(18)
     pending[token] = {
         "text": data.get("text", "") or "",
+        "entities": data.get("entities", []) or [],
         "buttons": data.get("buttons", []) or [],
         "created_at": time.time(),
     }
@@ -148,6 +149,7 @@ async def update_helper(data):
         raise ValueError("missing_inline_message_id")
 
     pending[token]["text"] = data.get("text", "") or ""
+    pending[token]["entities"] = data.get("entities", []) or []
     pending[token]["buttons"] = data.get("buttons", []) or []
     pending[token]["created_at"] = time.time()
     pending[token]["inline_message_id"] = inline_message_id
