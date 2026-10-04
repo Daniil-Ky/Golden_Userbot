@@ -85,7 +85,8 @@ client = None
 CONFIG_FILE = "userbot_config.txt"
 config = {
     "mine_work_chat": None,
-    "thx_source_chat": None,
+    "thx_source_chat": -1001565066632,
+    "promo_source_chat": -1001565066632,
     "thx_enabled": False,
     "tc_template_chat": None,
     "tc_template_message": None,
@@ -109,7 +110,7 @@ def load_config():
                     config[k] = None
                 elif k == "thx_enabled":
                     config[k] = v.lower() == "true"
-                elif k in ("mine_work_chat", "thx_source_chat",
+                elif k in ("mine_work_chat", "thx_source_chat", "promo_source_chat",
                            "tc_template_chat", "tc_template_message"):
                     config[k] = int(v) if v.lstrip("-").isdigit() else v
                 else:
@@ -129,9 +130,17 @@ def save_config():
 
 load_config()
 
+# Shared source chat for Thx and promo announcements. Older config files that
+# do not contain the new key automatically receive the historical default.
+if config.get("thx_source_chat") is None:
+    config["thx_source_chat"] = -1001565066632
+if config.get("promo_source_chat") is None:
+    config["promo_source_chat"] = -1001565066632
+
 STATUS_MESSAGE_LIFETIME = 180
 active_tasks = {}
 promo_task = None
+daily_task = None
 thx_last_event_id = None
 lm_task = None
 lm_state = None
@@ -663,6 +672,44 @@ async def promo_activate_code(code, attempts=3):
     return False, ""
 
 
+async def promo_activate_from_source(code):
+    """Активирует код из исходного чата, если его ещё нет в promo_seen."""
+    code = (code or "").strip()
+    if not code or config["mine_work_chat"] is None:
+        return
+
+    seen = {
+        x.strip() for x in config.get("promo_seen", "").split(",") if x.strip()
+    }
+    if code in seen:
+        logger.info("[PROMO] код %r уже есть в promo_seen", code)
+        return
+
+    logger.info("[PROMO] найден новый код в исходном чате: %r", code)
+    ok, _ = await promo_activate_code(code)
+    if ok:
+        seen.add(code)
+        config["promo_seen"] = ",".join(sorted(seen))
+        save_config()
+        logger.info("[PROMO] код %r успешно активирован из исходного чата", code)
+
+
+async def daily_work_loop():
+    """Каждые 24 часа отправляет два отдельных сообщения в Work."""
+    while True:
+        try:
+            if config["mine_work_chat"] is not None:
+                await client.send_message(config["mine_work_chat"], "Ежедневный бонус")
+                await client.send_message(config["mine_work_chat"], "Сорвать бананы")
+                logger.info("[DAILY] Отправлены «Ежедневный бонус» и «Сорвать бананы»")
+            await asyncio.sleep(86400)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка ежедневного цикла")
+            await asyncio.sleep(60)
+
+
 async def promo_loop():
     while True:
         try:
@@ -850,30 +897,57 @@ async def lm_wait_global_slot():
         await asyncio.sleep(wait)
 
 
+async def lm_get_max_transfer(job, retries=3):
+    """Получить актуальный максимум перед переводами игроку.
+
+    Проверка выполняется через общий ask_mineevo(), чтобы запрос максимума
+    не пересекался с другими запросами MineEVO и не забирал чужой ответ.
+    При временной ошибке запрос повторяется несколько раз.
+    """
+    work_chat = job["work_chat"]
+    for attempt in range(1, retries + 1):
+        try:
+            response = await ask_mineevo(
+                f"Перевести {job['nick']} {LM_PROBE_SUM}",
+                timeout=15.0,
+                internal=True,
+                chat_id=work_chat,
+            )
+            amount = parse_max_transfer(response.raw_text or "")
+            if amount:
+                return amount
+            logger.warning(
+                "Не удалось определить максимум для LM игрока %s "
+                "(попытка %s/%s): %r",
+                job["nick"], attempt, retries, response.raw_text,
+            )
+        except Exception:
+            logger.exception(
+                "Ошибка проверки максимума LM для %s (попытка %s/%s)",
+                job["nick"], attempt, retries,
+            )
+        if attempt < retries:
+            await asyncio.sleep(1.5)
+    return None
+
+
 async def lm_transfer_one(job):
-    """Resolve the transfer amount and send one queued player's limits."""
+    """Проверить максимум заново и выполнить переводы одного игрока."""
     global lm_state, lm_last_send_at
 
     work_chat = job["work_chat"]
 
-    try:
-        async with client.conversation(work_chat, timeout=60) as conv:
-            await conv.send_message(f"Перевести {job['nick']} {LM_PROBE_SUM}")
-            response = await conv.get_response()
-    except Exception:
-        logger.exception("Не удалось получить максимум для LM")
-        job["error"] = True
-        return False
-
-    amount = parse_max_transfer(response.raw_text or "")
+    # Каждый запуск следующего игрока ОБЯЗАТЕЛЬНО начинается с новой
+    # проверки максимума. Нельзя использовать максимум предыдущего игрока.
+    amount = await lm_get_max_transfer(job)
     if not amount:
-        logger.error("Не удалось определить максимальную сумму перевода для %s", job["nick"])
         job["error"] = True
         return False
 
     job["amount"] = amount
     if job.get("remaining") is None:
         job["remaining"] = job["total"]
+    job["error"] = False
 
     while job["remaining"] > 0:
         await lm_wait_global_slot()
@@ -892,9 +966,7 @@ async def lm_transfer_one(job):
             job["error"] = True
             return False
 
-        # The timestamp is intentionally preserved even if .lmstop is used.
-        # A new job started immediately afterwards must still wait the full
-        # remaining part of the global 60-second interval.
+        # Глобальный интервал сохраняется и после ошибки/перезапуска задачи.
         lm_last_send_at = send_started_at
         job["remaining"] -= 1
 
@@ -908,8 +980,16 @@ async def lm_transfer_loop():
         job = lm_queue.popleft()
         if job.get("paused"):
             continue
+
         lm_state = job
-        ok = await lm_transfer_one(job)
+        try:
+            ok = await lm_transfer_one(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Неожиданная ошибка очереди LM для %s", job.get("nick"))
+            job["error"] = True
+            ok = False
 
         if ok:
             try:
@@ -922,15 +1002,18 @@ async def lm_transfer_loop():
             except Exception:
                 logger.exception("Не удалось отправить сообщение о завершении LM")
         else:
-            try:
-                await client.send_message(
-                    job["destination_chat"],
-                    f"⚠️ <b>Перевод лимитов</b> игроку "
-                    f"<code>{job['nick']}</code> "
-                    f"не удалось выполнить. Задача оставлена вне очереди."
+            # Ошибка НЕ удаляет задачу. Возвращаем её в конец очереди, чтобы
+            # сначала могли продолжить другие игроки, а при следующем заходе
+            # максимум будет запрошен заново. Это особенно важно после
+            # завершения первого игрока: следующий всегда начинает с probe.
+            if not job.get("paused"):
+                lm_queue.append(job)
+                logger.warning(
+                    "Перевод игроку %s временно не выполнен; задача возвращена "
+                    "в очередь для повторной проверки максимума.",
+                    job.get("nick"),
                 )
-            except Exception:
-                logger.exception("Не удалось отправить сообщение об ошибке LM")
+            await asyncio.sleep(2)
 
         lm_state = None
 
@@ -2107,14 +2190,15 @@ async def register_handlers():
 
         await event.edit("⛔ <b>Автоатака боссов остановлена.</b>")
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.thxsource$"))
-    async def thxsource_handler(event):
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:thxsource|promosource)$"))
+    async def source_handler(event):
         config["thx_source_chat"] = event.chat_id
+        config["promo_source_chat"] = event.chat_id
         config["thx_enabled"] = True
         save_config()
         msg = await event.edit(
-            "✅ <b>Поиск Thx включён.</b>\n"
-            "Этот чат теперь является источником событий."
+            "✅ <b>Источник Thx и промокодов подключён.</b>\n"
+            "Этот чат теперь используется для Thx и поиска новых промокодов."
         )
         autodelete(msg)
 
@@ -2727,6 +2811,24 @@ async def register_handlers():
                 logger.exception("Ошибка reply к .evo")
 
     @client.on(events.NewMessage(incoming=True))
+    async def promo_source_watcher(event):
+        source_chat = config.get("promo_source_chat")
+        if source_chat is None or event.chat_id != source_chat:
+            return
+
+        text = event.raw_text or ""
+        match = re.search(
+            r"пиши\s+в\s+боте\s*:\s*промо\s+([A-Za-z0-9][A-Za-z0-9_+\-!?=./:]*)",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return
+
+        code = match.group(1)
+        asyncio.create_task(promo_activate_from_source(code))
+
+    @client.on(events.NewMessage(incoming=True))
     async def thx_watcher(event):
         global thx_last_event_id
         if not config["thx_enabled"]:
@@ -2744,19 +2846,23 @@ async def register_handlers():
 
 
 async def initialize():
-    global client, promo_task
+    global client, promo_task, daily_task
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
     client.parse_mode = "html"
     await register_handlers()
     await client.start()
     logger.info("Юзербот запущен")
     promo_task = asyncio.create_task(promo_loop())
+    daily_task = asyncio.create_task(daily_work_loop())
 
 
 async def shutdown():
-    global promo_task
+    global promo_task, daily_task
     if promo_task:
         promo_task.cancel()
         promo_task = None
+    if daily_task:
+        daily_task.cancel()
+        daily_task = None
     if client:
         await client.disconnect()
