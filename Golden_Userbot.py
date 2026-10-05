@@ -29,28 +29,37 @@ class LogSecurityExtension(logging.Filter):
         return "".join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            msg = record.msg
-            msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
-            msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
-            msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
-            
-            if any(k in msg.lower() for k in ["api_id", "auth", "login", "connect"]):
-                msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
-                
-            if any(k in msg.lower() for k in ["secret", "webhook", "helper"]):
-                msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
-                for word in msg.split():
-                    if len(word) >= 16 and any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
-                        msg = msg.replace(word, "[SECRET_DATA_HIDDEN]")
-            elif any(k in msg.lower() for k in ["bot", "token", "api", "url"]):
-                msg = self._url_rx.sub("[URL_MASKED]", msg)
-                
-            record.msg = msg
+        # Format the complete record first, including logger arguments. This
+        # prevents secrets from escaping when code uses logger.info("%s", url).
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+
+        msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
+        msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
+        msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
+
+        lower = msg.lower()
+        if any(k in lower for k in ["api_id", "auth", "login", "connect"]):
+            msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
+            lower = msg.lower()
+
+        if any(k in lower for k in ["secret", "webhook", "helper"]):
+            msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
+        elif any(k in lower for k in ["bot", "token", "api", "url"]):
+            msg = self._url_rx.sub("[URL_MASKED]", msg)
+
+        # The record is now a fully sanitized plain string; clear args so the
+        # original secret cannot be interpolated again by the formatter.
+        record.msg = msg
+        record.args = ()
         return True
 
 security_extension = LogSecurityExtension()
 logger.addFilter(security_extension)
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(security_extension)
 logger.info(security_extension)
 
 PORT = int(os.environ.get("PORT", "10000"))
