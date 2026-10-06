@@ -392,6 +392,98 @@ async def publish_evo_direct(response, destination_chat, reply_to=None):
     return sent
 
 
+async def ask_mineevo_evo(text, timeout=60.0):
+    """Для .evo: вернуть ответ, следующий непосредственно после «Ожидайте…»."""
+    if not text:
+        return None
+    target_chat = config["mine_work_chat"]
+    if target_chat is None:
+        raise RuntimeError(".work не настроен")
+
+    async with ask_mineevo_lock:
+        sent = await client.send_message(target_chat, text)
+        deadline = asyncio.get_running_loop().time() + timeout
+        first = None
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.20)
+            messages = await client.get_messages(target_chat, limit=30)
+            candidates = []
+            for msg in messages:
+                if msg.id <= sent.id or msg.out:
+                    continue
+                try:
+                    sender = await msg.get_sender()
+                    if sender is None or not getattr(sender, "bot", False):
+                        continue
+                except Exception:
+                    continue
+                candidates.append(msg)
+            if not candidates:
+                continue
+            first = min(candidates, key=lambda m: m.id)
+            raw = re.sub(r"\s+", " ", (first.raw_text or "").strip()).lower()
+            if raw in {"ожидайте", "ожидайте...", "ожидайте…"}:
+                # После промежуточного «Ожидайте…» принимаем только
+                # непосредственно следующее сообщение MineEVO.
+                while asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.20)
+                    messages = await client.get_messages(target_chat, limit=30)
+                    next_messages = []
+                    for msg in messages:
+                        if msg.id <= first.id or msg.out:
+                            continue
+                        try:
+                            sender = await msg.get_sender()
+                            if sender is None or not getattr(sender, "bot", False):
+                                continue
+                        except Exception:
+                            continue
+                        next_messages.append(msg)
+                    if next_messages:
+                        return min(next_messages, key=lambda m: m.id)
+                return None
+            return first
+    return None
+
+
+async def update_evo_waiting_message(waiting_message, response):
+    """Превратить уже отправленное «Ожидайте…» в итог MineEVO."""
+    buttons, callback_keys = _direct_evo_buttons(
+        response, waiting_message.chat_id, waiting_message.id
+    )
+
+    # Удаляем старые callback-связи, если сообщение уже использовалось.
+    old = direct_evo_messages.get((waiting_message.chat_id, waiting_message.id), {})
+    for key in old.get("callback_keys", set()):
+        direct_evo_callbacks.pop(key, None)
+
+    edit_kwargs = {
+        "formatting_entities": response.entities or [],
+        "buttons": buttons,
+    }
+    if response.media is not None:
+        edit_kwargs["file"] = response.media
+
+    await client.edit_message(
+        waiting_message.chat_id,
+        waiting_message.id,
+        response.raw_text or "",
+        **edit_kwargs,
+    )
+
+    for key in callback_keys:
+        direct_evo_callbacks[key]["destination_message_id"] = waiting_message.id
+
+    direct_evo_messages[(waiting_message.chat_id, waiting_message.id)] = {
+        "source_chat": response.chat_id,
+        "source_message_id": response.id,
+        "destination_chat": waiting_message.chat_id,
+        "destination_message_id": waiting_message.id,
+        "callback_keys": set(callback_keys),
+    }
+    return waiting_message
+
+
 async def _refresh_direct_evo_message(link):
     source = await client.get_messages(link["source_chat"], ids=link["source_message_id"])
     if not source:
@@ -2372,43 +2464,25 @@ async def register_handlers():
                 "<code>.work</code>."
             )
         try:
-            response = await ask_mineevo(args)
-            if response is None:
-                return await answer_and_delete(
-                    event, "⚠️ MineEVO не ответил."
-                )
             reply_to = event.reply_to_msg_id if event.is_reply else None
-            has_custom_emoji = any(
-                type(entity).__name__ == "MessageEntityCustomEmoji"
-                for entity in (response.entities or [])
+            waiting = await client.send_message(
+                event.chat_id,
+                "Ожидайте…",
+                reply_to=reply_to,
             )
-            if has_custom_emoji:
-                # User-account send preserves custom emoji entities. This also
-                # avoids the Bot API Premium requirement for custom emoji.
-                sent = await publish_evo_direct(
-                    response, event.chat_id, reply_to=reply_to
-                )
-                logger.info("[EVO] Direct send with custom emoji: message_id=%s", sent.id)
-            else:
-                data, callback_links = _message_to_helper_data(
-                    response, event.chat_id
-                )
-                source_link = {
-                    "source_chat": response.chat_id,
-                    "source_message_id": response.id,
-                    "destination_chat": event.chat_id,
-                    "callback_links": callback_links,
-                }
-                await publish_through_helper(
-                    data, event.chat_id, reply_to=reply_to,
-                    source_link=source_link
-                )
+            response = await ask_mineevo_evo(args)
+            if response is None:
+                await client.edit_message(event.chat_id, waiting.id, "⚠️ MineEVO не ответил.")
+                return await event.delete()
+
+            await update_evo_waiting_message(waiting, response)
             await event.delete()
         except Exception:
             logger.exception("Ошибка .evo")
-            await event.edit(
-                "⚠️ <b>Не удалось получить ответ MineEVO.</b>"
-            )
+            try:
+                await event.edit("⚠️ <b>Не удалось получить ответ MineEVO.</b>")
+            except Exception:
+                pass
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.tcset$"))
     async def tcset_handler(event):
