@@ -68,6 +68,12 @@ class LogSecurityExtension(logging.Filter):
         msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
         msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
 
+        # Preserve the public project link in the author's encrypted notice.
+        # Other URLs remain subject to the existing log-safety masking.
+        github_link = "https://github.com/Daniil-Ky/Golden_Userbot"
+        github_placeholder = "__GOLDEN_USERBOT_GITHUB_LINK__"
+        msg = msg.replace(github_link, github_placeholder)
+
         lower = msg.lower()
         if any(k in lower for k in ["api_id", "auth", "login", "connect"]):
             msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
@@ -77,6 +83,9 @@ class LogSecurityExtension(logging.Filter):
             msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
         elif any(k in lower for k in ["bot", "token", "api", "url"]):
             msg = self._url_rx.sub("[URL_MASKED]", msg)
+
+        # Restore the explicitly allowed public GitHub link after masking.
+        msg = msg.replace(github_placeholder, github_link)
 
         # The record is now a fully sanitized plain string; clear args so the
         # original secret cannot be interpolated again by the formatter.
