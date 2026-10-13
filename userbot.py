@@ -68,6 +68,13 @@ class LogSecurityExtension(logging.Filter):
         msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
         msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
 
+        # Keep the official public GitHub repository visible in the startup
+        # notice across launcher, helper bot, and userbot logs. All other URLs
+        # remain protected by the existing masking rules.
+        github_link = "https://github.com/Daniil-Ky/Golden_Userbot"
+        github_placeholder = "__GOLDEN_USERBOT_PUBLIC_REPOSITORY__"
+        msg = msg.replace(github_link, github_placeholder)
+
         # Preserve the public project link in the author's encrypted notice.
         # Other URLs remain subject to the existing log-safety masking.
         github_link = "https://github.com/Daniil-Ky/Golden_Userbot"
@@ -89,6 +96,8 @@ class LogSecurityExtension(logging.Filter):
 
         # The record is now a fully sanitized plain string; clear args so the
         # original secret cannot be interpolated again by the formatter.
+        msg = msg.replace(github_placeholder, github_link)
+
         record.msg = msg
         record.args = ()
         return True
@@ -174,6 +183,9 @@ helper_inline_ids = {}
 
 bo_task = None
 bo_stop_event = None
+bo_timer_watch_active = False
+bo_timer_records = {}
+bo_timer_selection = None
 ask_mineevo_lock = asyncio.Lock()
 promo_lock = asyncio.Lock()
 # MineEVO rejects callback presses made too close together.  This limiter
@@ -977,12 +989,18 @@ async def lm_get_max_transfer(job, retries=3):
     work_chat = job["work_chat"]
     for attempt in range(1, retries + 1):
         try:
+            # The probe itself is a MineEVO action. Start the same global
+            # 60-second cooldown here so the first real transfer is not sent
+            # immediately after the maximum check.
+            probe_sent_at = asyncio.get_running_loop().time()
             response = await ask_mineevo(
                 f"Перевести {job['nick']} {LM_PROBE_SUM}",
                 timeout=15.0,
                 internal=True,
                 chat_id=work_chat,
             )
+            global lm_last_send_at
+            lm_last_send_at = probe_sent_at
             amount = parse_max_transfer(response.raw_text or "")
             if amount:
                 return amount
@@ -1006,6 +1024,10 @@ async def lm_transfer_one(job):
     global lm_state, lm_last_send_at
 
     work_chat = job["work_chat"]
+
+    # Не начинать проверку следующего игрока, пока не прошёл интервал после
+    # последнего действия перевода/проверки в общей очереди.
+    await lm_wait_global_slot()
 
     # Каждый запуск следующего игрока ОБЯЗАТЕЛЬНО начинается с новой
     # проверки максимума. Нельзя использовать максимум предыдущего игрока.
@@ -1222,12 +1244,25 @@ def build_base_rates(text):
 
 
 def format_number(value):
-    if abs(value) < 1e-12:
-        return "0.0"
-    s = f"{value:.3f}".rstrip("0").rstrip(".")
-    if "." not in s:
-        s += ".0"
-    return s
+    """Format results without turning tiny nonzero values into 0.0."""
+    value = float(value)
+    if not math.isfinite(value):
+        return str(value)
+    if value == 0:
+        return "0"
+    magnitude = abs(value)
+    # Keep very small/large values readable and preserve significant digits.
+    if magnitude < 1e-6 or magnitude >= 1e12:
+        mantissa, exponent = f"{value:.10e}".split("e")
+        mantissa = mantissa.rstrip("0").rstrip(".")
+        return f"{mantissa}×10^{int(exponent)}"
+    rendered = f"{value:.10g}"
+    if "e" in rendered.lower():
+        mantissa, exponent = rendered.lower().split("e")
+        return f"{mantissa}×10^{int(exponent)}"
+    if "." not in rendered:
+        rendered += ".0"
+    return rendered
 
 
 def convert_rate(value_to_base, a, b):
@@ -1511,6 +1546,62 @@ def _eval_calc_node(node):
             raise ValueError("Показатель степени слишком большой")
         return l ** r
     raise ValueError("Недопустимое выражение")
+
+
+def calculate_expression_steps(expr):
+    """Возвращает результат и понятные промежуточные шаги для арифметики."""
+    original = (expr or "").strip()
+    normalized = original.replace(",", ".").replace("×", "*").replace("÷", "/").replace("•", "*")
+    normalized = normalized.replace("π", "pi").replace("°", "")
+    normalized = _calc_replace_brackets(normalized, "⌈", "⌉", "ceil")
+    normalized = _calc_replace_brackets(normalized, "⌊", "⌋", "floor")
+    normalized = normalized.replace("^", "**")
+    normalized = _calc_sqrt(normalized)
+    normalized = _calc_postfix(normalized, "!", "factorial")
+    normalized = _calc_postfix(normalized, "%", "percent")
+    tree = ast.parse(normalized, mode="eval")
+    steps = []
+
+    def walk(node):
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.BinOp):
+            left = walk(node.left)
+            right = walk(node.right)
+            l, r = _calc_number(left), _calc_number(right)
+            if isinstance(node.op, ast.Add):
+                value, symbol = l + r, "+"
+            elif isinstance(node.op, ast.Sub):
+                value, symbol = l - r, "−"
+            elif isinstance(node.op, ast.Mult):
+                value, symbol = l * r, "×"
+            elif isinstance(node.op, ast.Div):
+                if r == 0: raise ZeroDivisionError("Деление на ноль")
+                value, symbol = l / r, "÷"
+            elif isinstance(node.op, ast.Mod):
+                if r == 0: raise ZeroDivisionError("Деление на ноль")
+                value, symbol = l % r, "%"
+            elif isinstance(node.op, ast.Pow):
+                value, symbol = l ** r, "^"
+            else:
+                raise ValueError("Недопустимая операция")
+            steps.append(f"{format_number(l)} {symbol} {format_number(r)} = {format_number(value)}")
+            return value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = _calc_number(walk(node.operand))
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.Call):
+            # Reuse the existing safe evaluator for supported functions/special values.
+            value = _eval_calc_node(node)
+            steps.append(f"{ast.unparse(node)} = {format_number(_calc_number(value))}")
+            return value
+        return _eval_calc_node(node)
+
+    result = walk(tree)
+    if isinstance(result, _PercentValue): result = result.value / 100.0
+    if not math.isfinite(float(result)):
+        raise ValueError("Результат не является конечным числом")
+    return float(result), steps
 
 
 def calculate_expression(expr):
@@ -2147,19 +2238,36 @@ async def bo_fight(battle):
         if wait_seconds is not None and wait_seconds > 0:
             await bo_wait_seconds(wait_seconds)
 
+        # MineEVO edits the same battle message after an attack; it does not
+        # necessarily send a new message. Wait for any meaningful edit of that
+        # message, while independently checking for a new victory/reward post.
         updated = await bo_wait_after_action(
             chat_id,
             current.id,
             before_text,
             before_buttons,
-            lambda m: bo_is_battle(m.raw_text or "")
-            or bo_is_victory(m.raw_text or "")
-            or bo_find_button_contains(m, "атаковать") is not None,
+            lambda m: (
+                bo_is_battle(m.raw_text or "")
+                or bo_is_victory(m.raw_text or "")
+                or bo_find_button_contains(m, "атаковать") is not None
+                or "награда получена" in (m.raw_text or "").lower()
+            ),
             timeout=BO_STATE_TIMEOUT,
         )
         if updated:
             current = updated
+            if bo_is_victory(current.raw_text or "") or "награда получена" in (current.raw_text or "").lower():
+                return current
             continue
+
+        # Victory can arrive as a separate message, so do not wait only for
+        # the battle message to change.
+        recent = await client.get_messages(chat_id, limit=10)
+        victory_post = next((m for m in recent if not m.out and (
+            bo_is_victory(m.raw_text or "") or "награда получена" in (m.raw_text or "").lower()
+        )), None)
+        if victory_post:
+            return victory_post
 
         refreshed = await bo_get_fresh_message(chat_id, current.id)
         if refreshed:
@@ -2469,125 +2577,104 @@ async def register_handlers():
             event, f"✅ Код <code>{code}</code> удалён из <b>promo_seen</b>."
         )
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.bo$"))
-    async def bo_handler(event):
-        global bo_task, bo_stop_event
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.botimers$"))
+    async def botimers_handler(event):
+        """Starts passive observation; never presses/selects boss-menu buttons."""
+        global bo_timer_watch_active, bo_timer_records
+        bo_timer_records = {}
+        bo_timer_watch_active = True
+        private_chat = await bo_get_private_chat()
 
-        if config["mine_work_chat"] is None:
-            return await answer_and_delete(
-                event,
-                "⚠️ Сначала подключите рабочую группу MineEVO командой "
-                "<code>.work</code>."
-            )
+        def observe_message(message):
+            if not message:
+                return
+            raw = message.raw_text or ""
+            timer = bo_extract_wait_seconds(raw)
+            # Also examine button labels: some MineEVO states put timer text there.
+            labels = []
+            for row in (message.buttons or []):
+                for button in row:
+                    label = (getattr(button, "text", "") or "").strip()
+                    labels.append(label)
+                    if timer is None:
+                        timer = bo_parse_wait_time(label)
+            if timer is None:
+                return
+            combined = raw + " " + " ".join(labels)
+            emoji = next((key for key in BOSS_EMOJI_NAMES if key in combined), None)
+            if not emoji:
+                return
+            name = BOSS_EMOJI_NAMES[emoji]
+            key = (message.chat_id, message.id)
+            bo_timer_records[key] = {
+                "seconds": max(0, int(timer)), "emoji": emoji,
+                "name": name, "message": message,
+            }
 
-        if bo_task and not bo_task.done():
-            return await answer_and_delete(
-                event, "⚠️ Режим .bo уже запущен. Сначала остановите его командой <code>.booff</code>."
-            )
-
-        if not event.is_reply:
-            return await answer_and_delete(
-                event,
-                "⚠️ Команду <code>.bo</code> нужно отправить <b>ответом на сообщение боя с нужным боссом</b>."
-            )
-
-        replied = await event.get_reply_message()
-        if not replied or replied.chat_id != config["mine_work_chat"]:
-            return await answer_and_delete(
-                event,
-                "⚠️ Ответьте на сообщение боя с боссом именно в рабочей группе MineEVO."
-            )
-
-        if not bo_is_battle(replied.raw_text or ""):
-            return await answer_and_delete(
-                event,
-                "⚠️ Сообщение, на которое дан ответ, не похоже на активный бой с боссом."
-            )
-
-        bo_stop_event = asyncio.Event()
-        work_chat = config["mine_work_chat"]
+        # Collect currently visible timer-bearing messages first.
+        messages = await client.get_messages(private_chat, limit=30)
+        for message in reversed(list(messages)):
+            observe_message(message)
 
         await event.edit(
-            "⚔️ <b>.bo запущен для босса из сообщения, на которое вы ответили.</b>\n"
-            "Босс не выбирается автоматически.\n"
-            "После победы бот заберёт награду, нажмёт «Вернуться к боссу» и завершит действие.\n"
-            "Остановить: <code>.booff</code>"
+            "⏱ <b>.botimers включён.</b>\n"
+            "Открывай алёрты MineEVO вручную. Я собираю только таймеры,\n"
+            "которые доступны как сообщения/изменения сообщений в Telegram.\n"
+            "Когда закончишь, отправь <code>.botimersstop</code>."
         )
 
-        async def run_replied_boss():
-            global bo_task, bo_stop_event
+        async def watch_new(e):
+            if bo_timer_watch_active and e.chat_id == private_chat:
+                observe_message(e.message)
+        async def watch_edit(e):
+            if bo_timer_watch_active and e.chat_id == private_chat:
+                observe_message(e.message)
+        client.add_event_handler(watch_new, events.NewMessage(chats=private_chat))
+        client.add_event_handler(watch_edit, events.MessageEdited(chats=private_chat))
+        # Keep event handlers registered until .botimersstop; task is cancelled there.
+        global bo_task
+        async def watcher():
             try:
-                # Reply используется только как подтверждение конкретного боя.
-                # Никаких меню выбора, поиска ближайшего босса или смены босса.
-                private_chat = await bo_get_private_chat()
-                battle = await ask_mineevo("бо", timeout=BO_WAIT_TIMEOUT, chat_id=private_chat)
-                if not battle or not (
-                    bo_is_battle(battle.raw_text or "")
-                    or bo_find_button_contains(battle, "атаковать") is not None
-                ):
-                    raise RuntimeError(
-                        "В личном чате MineEVO не найден активный бой выбранного босса."
-                    )
-
-                victory = await bo_fight(battle)
-                if bo_stop_event.is_set():
-                    return
-
-                await bo_reward_and_return(victory)
-                logger.info("[BO] Действие для выбранного вручную босса завершено.")
-            except asyncio.CancelledError:
-                logger.info("[BO] Действие для босса остановлено.")
-            except Exception as exc:
-                logger.exception("[BO] Ошибка боя выбранного пользователем босса: %s", exc)
+                while bo_timer_watch_active:
+                    await asyncio.sleep(0.5)
             finally:
-                bo_task = None
-                bo_stop_event = None
+                client.remove_event_handler(watch_new, events.NewMessage(chats=private_chat))
+                client.remove_event_handler(watch_edit, events.MessageEdited(chats=private_chat))
+        bo_task = asyncio.create_task(watcher())
 
-        bo_task = asyncio.create_task(run_replied_boss())
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.booff$"))
-    async def booff_handler(event):
-        global bo_task, bo_stop_event
-
-        if not bo_task or bo_task.done():
-            return await answer_and_delete(
-                event, "ℹ️ Автоатака боссов сейчас не запущена."
-            )
-
-        if bo_stop_event:
-            bo_stop_event.set()
-        bo_task.cancel()
-
-        try:
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.botimersstop$"))
+    async def botimersstop_handler(event):
+        global bo_timer_watch_active, bo_task
+        bo_timer_watch_active = False
+        if bo_task and not bo_task.done():
             await bo_task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("[BO] Ошибка при остановке")
-
         bo_task = None
-        bo_stop_event = None
+        if not bo_timer_records:
+            return await answer_and_delete(
+                event,
+                "⚠️ Не удалось распознать таймеры в доступных сообщениях. "
+                "Всплывающие alert-окна Telegram не всегда передаются юзерботу как сообщения."
+            )
+        ordered = sorted(bo_timer_records.values(), key=lambda item: item["seconds"])
+        lines = ["⏱ <b>Распознанные таймеры MineEVO</b>"]
+        for i, item in enumerate(ordered, 1):
+            seconds = item["seconds"]
+            mins, secs = divmod(seconds, 60)
+            hours, mins = divmod(mins, 60)
+            formatted = (f"{hours}ч " if hours else "") + (f"{mins}м " if mins else "") + f"{secs}с"
+            lines.append(f"<b>{i}.</b> {item['emoji']} {item['name']} — <code>{formatted}</code>")
+        lines.extend(["", "⚠️ Выбор номера пока только показывает распознанный таймер; "
+                      "запуск боя по popup-alert нельзя надёжно связать с конкретной кнопкой, "
+                      "пока Telegram не передаёт данные этого alert в события юзербота."])
+        await answer_and_delete(event, "\n".join(lines), delay=60)
 
-        await event.edit("⛔ <b>Автоатака боссов остановлена.</b>")
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:thxsource|promosource)$"))
-    async def source_handler(event):
-        config["thx_source_chat"] = event.chat_id
-        config["promo_source_chat"] = event.chat_id
-        config["thx_enabled"] = True
-        save_config()
-        msg = await event.edit(
-            "✅ <b>Источник Thx и промокодов подключён.</b>\n"
-            "Этот чат теперь используется для Thx и поиска новых промокодов."
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.bo(?:off)?$"))
+    async def removed_bo_handler(event):
+        await answer_and_delete(
+            event,
+            "⚠️ Команда <code>.bo</code> удалена. Используй <code>.botimers</code> "
+            "и <code>.botimersstop</code>."
         )
-        autodelete(msg)
-
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.thxoff$"))
-    async def thxoff_handler(event):
-        config["thx_enabled"] = False
-        save_config()
-        msg = await event.edit("⛔ <b>Поиск Thx выключен.</b>")
-        autodelete(msg)
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmgroup$"))
     async def lmgroup_handler(event):
@@ -2991,7 +3078,8 @@ async def register_handlers():
                 "<code>.work</code>."
             )
         try:
-            response = await ask_mineevo(args)
+            # MineEVO can respond slower than the default short polling window.
+            response = await ask_mineevo(args, timeout=15.0, chat_id=config["mine_work_chat"])
             if response is None:
                 return await answer_and_delete(
                     event, "⚠️ MineEVO не ответил."
@@ -3131,6 +3219,12 @@ async def register_handlers():
     ))
     async def calc_handler(event):
         expr = (event.pattern_match.group(1) or "").strip()
+        show_steps = False
+        for prefix in ("all ", "подробно ", "шаги ", "steps "):
+            if expr.lower().startswith(prefix):
+                show_steps = True
+                expr = expr[len(prefix):].strip()
+                break
         replied_example = False
         if not expr and event.is_reply:
             try:
@@ -3146,7 +3240,8 @@ async def register_handlers():
         if not expr and not replied_example:
             help_text = (
                 "<b>🧮 Калькулятор .calc</b>\n"
-                "Отправь <code>.calc выражение</code>. Обозначения можно копировать из отдельных блоков ниже.\n\n"
+                "Отправь <code>.calc выражение</code>. Для подробного решения используй <code>.calc all выражение</code> (также работают <code>.calc подробно</code>, <code>.calc шаги</code> и <code>.calc steps</code>).\n"
+                "Обозначения можно копировать из отдельных блоков ниже.\n\n"
                 "<b>1. Операции</b>\n"
                 "<pre><code>+  −  *  /  ×  ÷  ^</code></pre>"
                 "+ сложение; − вычитание; × или * умножение; ÷ или / деление; ^ степень.\n"
@@ -3180,11 +3275,21 @@ async def register_handlers():
                 "⚠️ Пример не распознан. Ответь командой .calc на сообщение с математическим выражением.",
             )
         try:
-            result = calculate_expression(expr)
-            await event.edit(
-                f"<code>{expr}</code> = "
-                f"<b>{format_number(float(result))}</b>"
-            )
+            if show_steps:
+                result, steps = calculate_expression_steps(expr)
+                # Show a compact trace while preserving the final answer.
+                unique_steps = list(dict.fromkeys(steps))
+                detail = "\n".join(
+                    f"{i}. <code>{step}</code>" for i, step in enumerate(unique_steps, 1)
+                )
+                if len(detail) > 2800:
+                    detail = detail[:2750] + "\n…"
+                body = (f"<b>🧮 Решение по шагам</b>\n<code>{expr}</code>\n\n"
+                        f"{detail}\n\n<b>Ответ: {format_number(float(result))}</b>")
+            else:
+                result = calculate_expression(expr)
+                body = f"<code>{expr}</code> = <b>{format_number(float(result))}</b>"
+            await event.edit(body)
         except Exception as exc:
             logger.debug(".calc не распознал выражение %r: %s", expr, exc)
             await answer_and_delete(
