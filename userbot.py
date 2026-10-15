@@ -16,6 +16,11 @@ import logging
 import secrets
 import ast
 import math
+import sympy as sp
+from sympy.parsing.sympy_parser import (
+    parse_expr, standard_transformations, implicit_multiplication_application,
+    convert_xor, function_exponentiation, rationalize,
+)
 from collections import deque
 from typing import Optional
 
@@ -178,6 +183,8 @@ lm_last_send_at = None
 
 mine_callback_links = {}
 mine_callback_locks = {}
+direct_evo_callbacks = {}
+direct_evo_messages = {}
 inline_reply_links = {}
 helper_inline_ids = {}
 
@@ -396,16 +403,12 @@ async def publish_evo_direct(response, destination_chat, reply_to=None):
     buttons, callback_keys = _direct_evo_buttons(
         response, destination_chat, destination_message_id=None
     )
-    if getattr(response, "media", None) is not None:
-        # Media responses must be sent through the user account: Telegram's
-        # inline-article API cannot carry arbitrary photos/videos/documents/GIFs.
+    if response.media is not None:
         sent = await client.send_file(
-            destination_chat,
-            response.media,
-            caption=response.raw_text or "",
+            destination_chat, response.media,
+            caption=response.raw_text or None,
             formatting_entities=response.entities or [],
-            buttons=buttons,
-            reply_to=reply_to,
+            buttons=buttons, reply_to=reply_to,
         )
     else:
         sent = await client.send_message(
@@ -441,34 +444,13 @@ async def _refresh_direct_evo_message(link):
     buttons, callback_keys = _direct_evo_buttons(
         source, link["destination_chat"], link["destination_message_id"]
     )
-    if getattr(source, "media", None) is not None:
-        # Telegram cannot change a text message into a media message by editing.
-        # For an existing media message, update its caption/media when supported;
-        # otherwise replace it with the new media while keeping its callback map.
-        try:
-            await client.edit_message(
-                link["destination_chat"], link["destination_message_id"],
-                source.raw_text or "", file=source.media,
-                formatting_entities=source.entities or [], buttons=buttons,
-            )
-        except Exception:
-            await client.delete_messages(
-                link["destination_chat"], [link["destination_message_id"]]
-            )
-            sent = await client.send_file(
-                link["destination_chat"], source.media,
-                caption=source.raw_text or "",
-                formatting_entities=source.entities or [], buttons=buttons,
-            )
-            link["destination_message_id"] = sent.id
-    else:
-        await client.edit_message(
-            link["destination_chat"],
-            link["destination_message_id"],
-            source.raw_text or "",
-            formatting_entities=source.entities or [],
-            buttons=buttons,
-        )
+    await client.edit_message(
+        link["destination_chat"],
+        link["destination_message_id"],
+        source.raw_text or "",
+        formatting_entities=source.entities or [],
+        buttons=buttons,
+    )
     link["callback_keys"] = set(callback_keys)
     direct_evo_messages[(link["destination_chat"], link["destination_message_id"])] = link
     return source
@@ -497,53 +479,6 @@ async def publish_through_helper(data, destination_chat, reply_to=None,
             }
         inline_reply_links[(sent.chat_id, sent.id)] = link
     return sent, token
-
-
-async def watch_evo_followup(wait_response, destination_link, direct=False, timeout=90.0):
-    """If MineEVO first says «Ожидайте…», update the same result on follow-up."""
-    text = (wait_response.raw_text or "").strip().lower()
-    if not text.startswith("ожидайте"):
-        return
-    source_chat = wait_response.chat_id
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.5)
-        try:
-            messages = await client.get_messages(source_chat, limit=30)
-        except Exception:
-            continue
-        candidates = sorted(
-            (m for m in messages if m.id > wait_response.id and not m.out),
-            key=lambda m: m.id,
-        )
-        if not candidates:
-            continue
-        final = candidates[0]
-        # Ignore further progress notices and wait for the actual result.
-        if (final.raw_text or "").strip().lower().startswith("ожидайте"):
-            wait_response = final
-            continue
-        try:
-            destination_link["source_chat"] = final.chat_id
-            destination_link["source_message_id"] = final.id
-            if direct:
-                await _refresh_direct_evo_message(destination_link)
-            else:
-                token = destination_link.get("helper_token")
-                inline_id = helper_inline_ids.get(token)
-                for _ in range(20):
-                    if inline_id:
-                        break
-                    await asyncio.sleep(0.25)
-                    inline_id = helper_inline_ids.get(token)
-                if inline_id and getattr(final, "media", None) is None:
-                    await update_helper_inline_message(final, destination_link, inline_id)
-                elif getattr(final, "media", None) is not None:
-                    logger.warning("[EVO] Follow-up result contains media; inline text message cannot be converted to media in-place")
-            return
-        except Exception:
-            logger.exception("[EVO] Не удалось обновить результат после «Ожидайте»")
-            return
 
 
 async def update_helper_inline_message(response, link, inline_message_id):
@@ -817,10 +752,14 @@ def parse_promo_codes(text):
 
 
 def promo_is_activated(text, code):
-    """Считает код активированным по подтверждению MineEVO."""
+    """Успех только после подтверждения MineEVO для конкретного кода."""
     if not text:
         return False
-    return f"🎉 Промокод {code} активирован" in text
+    normalized = re.sub(r"\s+", " ", text).strip()
+    return re.search(
+        rf"🎉\s*Промокод\s+{re.escape(code)}\s+активирован",
+        normalized, re.IGNORECASE,
+    ) is not None
 
 
 async def promo_send_and_wait(code, timeout=15.0):
@@ -838,7 +777,7 @@ async def promo_send_and_wait(code, timeout=15.0):
     return response
 
 
-async def promo_activate_code(code, attempts=1):
+async def promo_activate_code(code, attempts=3):
     """Отправляет промо-код обычным текстом и ждёт ответ MineEVO."""
     async with promo_lock:
         for attempt in range(1, attempts + 1):
@@ -1467,311 +1406,238 @@ def make_tc_output(template_text, target_names, quantity=1.0):
     )
 
 
-CALC_ALLOWED = re.compile(r"^[0-9A-Za-z_+\-*/().,%\s×÷•⋅√∛^!π°−⌈⌉⌊⌋]+$")
+CALC_ALLOWED = re.compile(r"^[0-9A-Za-z_+\-*/().,%\s×÷•⋅√∛^!πeE°−–—⌈⌉⌊⌋⁰¹²³⁴⁵⁶⁷⁸⁹]+$")
+
+_CALC_TRANSFORMATIONS = standard_transformations + (
+    implicit_multiplication_application, convert_xor,
+    function_exponentiation, rationalize,
+)
+_CALC_FUNCTIONS = {
+    "sqrt": sp.sqrt, "root": sp.root, "sin": sp.sin, "cos": sp.cos,
+    "tan": sp.tan, "asin": sp.asin, "acos": sp.acos, "atan": sp.atan,
+    "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
+    "asinh": sp.asinh, "acosh": sp.acosh, "atanh": sp.atanh,
+    "log": sp.log, "ln": sp.log, "exp": sp.exp, "abs": sp.Abs,
+    "floor": sp.floor, "ceil": sp.ceiling, "factorial": sp.factorial,
+    "min": sp.Min, "max": sp.Max,
+}
+_CALC_LOCALS = {**_CALC_FUNCTIONS, "pi": sp.pi, "π": sp.pi, "E": sp.E, "e": sp.E}
+_CALC_GLOBALS = {
+    "Integer": sp.Integer, "Float": sp.Float, "Rational": sp.Rational,
+    "Symbol": sp.Symbol, "Add": sp.Add, "Mul": sp.Mul, "Pow": sp.Pow,
+    "factorial": sp.factorial, "Tuple": sp.Tuple,
+}
+
+_SUPERSCRIPTS = str.maketrans({"⁰":"**0", "¹":"**1", "²":"**2", "³":"**3", "⁴":"**4", "⁵":"**5", "⁶":"**6", "⁷":"**7", "⁸":"**8", "⁹":"**9"})
 
 
-class _PercentValue:
-    def __init__(self, value):
-        self.value = float(value)
+def _normalize_calc_input(expr):
+    expr = (expr or "").strip()
+    if not expr or len(expr) > 500 or not CALC_ALLOWED.fullmatch(expr):
+        raise ValueError("Недопустимое выражение или слишком длинная запись")
+    expr = expr.translate(_SUPERSCRIPTS)
+    expr = expr.replace("−", "-").replace("–", "-").replace("—", "-")
+    expr = expr.replace("×", "*").replace("⋅", "*").replace("•", "*").replace("÷", "/")
+    expr = expr.replace("π", "pi").replace("°", "")
+    # Scientific notation commonly generated by AI/calculators: 6.67×10^-11.
+    expr = re.sub(r"(\d+(?:\.\d+)?)\s*\*\s*10\s*\*\*\s*([+\-]?\d+)", r"(\1*10**(\2))", expr)
+    # Cube roots and square roots with parenthesized or single-token arguments.
+    expr = re.sub(r"∛\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)", r"root((\1),3)", expr)
+    expr = re.sub(r"∛\s*([A-Za-z0-9.]+)", r"root((\1),3)", expr)
+    expr = re.sub(r"√\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)", r"sqrt((\1))", expr)
+    expr = re.sub(r"√\s*([A-Za-z0-9.]+)", r"sqrt(\1)", expr)
+    # Treat common Unicode/ASCII variants and implicit powers consistently.
+    expr = expr.replace("^", "**")
+    return expr
 
 
-def _calc_number(value):
-    if isinstance(value, _PercentValue):
-        return value.value / 100.0
-    return float(value)
+def _parse_calc_side(expr, symbols):
+    normalized = _normalize_calc_input(expr)
+    local_dict = dict(_CALC_LOCALS)
+    local_dict.update(symbols)
+    # parse_expr is constrained to a strict mathematical character whitelist and
+    # a small SymPy namespace; Python builtins and arbitrary calls are unavailable.
+    return parse_expr(
+        normalized, local_dict=local_dict, global_dict=_CALC_GLOBALS,
+        transformations=_CALC_TRANSFORMATIONS, evaluate=True,
+    )
 
 
-def _round_math(value):
-    """Обычное математическое округление: половины от нуля."""
-    value = float(value)
-    if value >= 0:
-        return float(math.floor(value + 0.5))
-    return float(math.ceil(value - 0.5))
+def _calc_format(value, digits=12):
+    try:
+        value = sp.N(value, digits)
+        if value.is_real is False:
+            return str(value)
+        as_float = float(value)
+        if not math.isfinite(as_float):
+            return str(value)
+        if abs(as_float) < 1e-7 or abs(as_float) >= 1e10:
+            return f"{as_float:.8g}"
+        return f"{as_float:.10g}"
+    except Exception:
+        return str(value)
 
 
-def _calc_replace_brackets(expr, left, right, function):
-    """Заменяет вложенные ⌈...⌉/⌊...⌋ на вызовы функции."""
-    while left in expr:
-        pos = expr.rfind(left)
-        depth = 0
-        close = None
-        for i in range(pos, len(expr)):
-            if expr[i] == left:
-                depth += 1
-            elif expr[i] == right:
-                depth -= 1
-                if depth == 0:
-                    close = i
+def _numeric_roots(expr, variable, lower=-100, upper=100, step=0.25):
+    """Find real roots numerically for equations without a closed form."""
+    roots = []
+    try:
+        fn = sp.lambdify(variable, expr, modules=["math"])
+    except Exception:
+        return roots
+
+    def safe_eval(v):
+        try:
+            y = float(fn(v))
+            return y if math.isfinite(y) else None
+        except Exception:
+            return None
+
+    x0 = float(lower)
+    y0 = safe_eval(x0)
+    while x0 < upper:
+        x1 = min(x0 + step, upper)
+        y1 = safe_eval(x1)
+        if y0 is not None and abs(y0) < 1e-8:
+            roots.append(x0)
+        if y0 is not None and y1 is not None and y0 * y1 < 0:
+            a, b, fa, fb = x0, x1, y0, y1
+            for _ in range(70):
+                mid = (a + b) / 2
+                fm = safe_eval(mid)
+                if fm is None:
                     break
-        if close is None:
-            raise ValueError("Не закрыто обозначение округления")
-        inner = expr[pos + 1:close]
-        expr = expr[:pos] + f"{function}({inner})" + expr[close + 1:]
-    if right in expr:
-        raise ValueError("Лишнее закрывающее обозначение округления")
-    return expr
+                if abs(fm) < 1e-12 or abs(b - a) < 1e-11:
+                    a = b = mid
+                    break
+                if fa * fm <= 0:
+                    b, fb = mid, fm
+                else:
+                    a, fa = mid, fm
+            roots.append((a + b) / 2)
+        x0, y0 = x1, y1
+    # Also try Newton seeds to catch roots that merely touch the x-axis.
+    for seed in [-50, -20, -10, -5, -2, -1, 0, 1, 2, 5, 10, 20, 50]:
+        try:
+            root = complex(sp.N(sp.nsolve(expr, variable, seed, verify=False)))
+            if abs(root.imag) < 1e-8 and math.isfinite(root.real):
+                roots.append(root.real)
+        except Exception:
+            pass
+    unique = []
+    for root in sorted(roots):
+        if lower - 1e-8 <= root <= upper + 1e-8 and all(abs(root-r) > 1e-5 for r in unique):
+            unique.append(root)
+    return unique
 
 
-def _calc_postfix(expr, symbol, function):
-    """Преобразует постфиксные ! и % в безопасные вызовы функций."""
-    while symbol in expr:
-        pos = expr.find(symbol)
-        if pos == 0 or expr[pos - 1].isspace():
-            raise ValueError("Перед специальным символом должно быть число или выражение")
-        end = pos
-        i = pos - 1
-        if expr[i] == ')':
-            depth = 0
-            while i >= 0:
-                if expr[i] == ')':
-                    depth += 1
-                elif expr[i] == '(':
-                    depth -= 1
-                    if depth == 0:
-                        break
-                i -= 1
-            if i < 0:
-                raise ValueError("Несбалансированные скобки")
-            start = i
-            # Захватываем имя функции перед скобками, если есть.
-            j = start - 1
-            while j >= 0 and (expr[j].isalnum() or expr[j] == '_'):
-                j -= 1
-            if j + 1 < start:
-                start = j + 1
+def solve_equation(equation, show_steps=False):
+    """Parse and solve a one-variable equation, returning a Russian result."""
+    if equation.count("=") != 1:
+        raise ValueError("Для уравнения нужен ровно один знак =")
+    left_text, right_text = equation.split("=", 1)
+    left_text, right_text = left_text.strip(), right_text.strip()
+    if not left_text or not right_text:
+        raise ValueError("Не хватает левой или правой части уравнения")
+    # Permit a broad but bounded set of mathematical symbols and names.
+    for part in (left_text, right_text):
+        if len(part) > 500 or not re.fullmatch(r"[0-9A-Za-z_+\-*/().,%\s×÷•⋅√∛^!π°−–—⌈⌉⌊⌋⁰¹²³⁴⁵⁶⁷⁸⁹]+", part):
+            raise ValueError("В уравнении есть неподдерживаемые символы")
+    names = set(re.findall(r"[A-Za-z_]+", (left_text + " " + right_text).replace("sin", "").replace("cos", "")))
+    # Function names/constants are not variables; equations are solved for one unknown.
+    reserved = set(_CALC_FUNCTIONS) | {"pi", "π", "e", "E"}
+    vars_found = sorted(name for name in names if name not in reserved)
+    if not vars_found:
+        # Constant equality: evaluate both sides directly.
+        symbols = {}
+        lhs, rhs = _parse_calc_side(left_text, symbols), _parse_calc_side(right_text, symbols)
+        same = sp.simplify(lhs-rhs) == 0
+        return ("Равенство верно." if same else f"Равенство неверно: {_calc_format(lhs)} ≠ {_calc_format(rhs)}"), ["Вычисляем обе части.", f"Левая часть: {_calc_format(lhs)}", f"Правая часть: {_calc_format(rhs)}"]
+    if len(vars_found) != 1:
+        raise ValueError("Пока можно автоматически решить уравнение только с одной неизвестной: " + ", ".join(vars_found))
+    variable = sp.Symbol(vars_found[0], real=True)
+    lhs = _parse_calc_side(left_text, {vars_found[0]: variable})
+    rhs = _parse_calc_side(right_text, {vars_found[0]: variable})
+    difference = sp.simplify(lhs-rhs)
+    if difference == 0:
+        return "Бесконечно много решений: левая и правая части тождественно равны.", ["Переносим всё в левую часть.", "Получаем 0 = 0, поэтому подходит любое допустимое значение переменной."]
+    if not difference.has(variable):
+        return "Решений нет: после упрощения получается ненулевое равенство констант.", [f"Упрощаем: {_calc_format(lhs)} = {_calc_format(rhs)}", "Левая и правая части не равны."]
+
+    steps = [f"1. Переносим всё в левую часть: {sp.sstr(difference)} = 0."]
+    solutions = None
+    try:
+        if difference.is_polynomial(variable):
+            poly = sp.Poly(difference, variable)
+            exact = sp.solve(poly.as_expr(), variable)
+            solutions = [sp.N(r, 14) for r in exact if sp.im(sp.N(r)) == 0]
+            steps.append(f"2. Это полиномиальное уравнение степени {poly.degree()}; находим его корни.")
         else:
-            while i >= 0 and (expr[i].isalnum() or expr[i] in '._'):
-                i -= 1
-            start = i + 1
-            # Унарный минус относится к числу, но не к выражению после оператора.
-            if start > 0 and expr[start - 1] == '-' and (
-                start - 1 == 0 or expr[start - 2] in '+-*/^( '
-            ):
-                start -= 1
-        operand = expr[start:end].strip()
-        if not operand:
-            raise ValueError("Пустой аргумент специального символа")
-        expr = expr[:start] + f"{function}({operand})" + expr[pos + 1:]
-    return expr
-
-
-def _calc_cbrt(expr):
-    """Поддерживает кубический корень: ∛64 и ∛(выражение)."""
-    while '∛' in expr:
-        pos = expr.rfind('∛')
-        i = pos + 1
-        while i < len(expr) and expr[i].isspace():
-            i += 1
-        if i >= len(expr):
-            raise ValueError("После ∛ требуется выражение")
-        if expr[i] == '(':
-            depth = 0
-            close = None
-            for j in range(i, len(expr)):
-                if expr[j] == '(':
-                    depth += 1
-                elif expr[j] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        close = j
-                        break
-            if close is None:
-                raise ValueError("Несбалансированные скобки")
-            operand = expr[i:close + 1]
-            expr = expr[:pos] + f"cbrt({operand})" + expr[close + 1:]
-        else:
-            match = re.match(r"(?:\d+(?:\.\d*)?|\.\d+|[A-Za-z_]+|π)", expr[i:])
-            if not match:
-                raise ValueError("После ∛ требуется число или скобки")
-            operand = match.group(0)
-            expr = expr[:pos] + f"cbrt({operand})" + expr[i + len(operand):]
-    return expr
-
-
-def _calc_sqrt(expr):
-    """Поддерживает √16, √(16/4) и вложенные скобки."""
-    while '√' in expr:
-        pos = expr.rfind('√')
-        i = pos + 1
-        while i < len(expr) and expr[i].isspace():
-            i += 1
-        if i >= len(expr):
-            raise ValueError("После √ требуется выражение")
-        if expr[i] == '(':
-            depth = 0
-            close = None
-            for j in range(i, len(expr)):
-                if expr[j] == '(':
-                    depth += 1
-                elif expr[j] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        close = j
-                        break
-            if close is None:
-                raise ValueError("Несбалансированные скобки")
-            operand = expr[i:close + 1]
-            expr = expr[:pos] + f"sqrt({operand})" + expr[close + 1:]
-        else:
-            match = re.match(r"(?:\d+(?:\.\d*)?|\.\d+|[A-Za-z_]+|π)", expr[i:])
-            if not match:
-                raise ValueError("После √ требуется число или скобки")
-            operand = match.group(0)
-            expr = expr[:pos] + f"sqrt({operand})" + expr[i + len(operand):]
-    return expr
-
-
-def _eval_calc_node(node):
-    if isinstance(node, ast.Expression):
-        return _eval_calc_node(node.body)
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) \
-            and not isinstance(node.value, bool):
-        return float(node.value)
-    if isinstance(node, ast.Name) and node.id in {"pi", "e"}:
-        return math.pi if node.id == "pi" else math.e
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-        value = _eval_calc_node(node.operand)
-        if isinstance(value, _PercentValue):
-            return _PercentValue(-value.value if isinstance(node.op, ast.USub) else value.value)
-        return +value if isinstance(node.op, ast.UAdd) else -value
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-            and node.func.id in {"sqrt", "cbrt", "log", "ln", "abs", "ceil", "floor", "round"} \
-            and len(node.args) == 1 and not node.keywords:
-        name = node.func.id
-        value = _calc_number(_eval_calc_node(node.args[0]))
-        if name == "sqrt":
-            if value < 0:
-                raise ValueError("Корень из отрицательного числа")
-            return math.sqrt(value)
-        if name == "cbrt":
-            return math.copysign(abs(value) ** (1.0 / 3.0), value)
-        if name == "log":
-            if value <= 0:
-                raise ValueError("log определён только для положительных чисел")
-            return math.log10(value)
-        if name == "ln":
-            if value <= 0:
-                raise ValueError("ln определён только для положительных чисел")
-            return math.log(value)
-        if name == "abs": return abs(value)
-        if name == "ceil": return float(math.ceil(value))
-        if name == "floor": return float(math.floor(value))
-        return _round_math(value)
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-            and node.func.id == "factorial" and len(node.args) == 1 and not node.keywords:
-        value = _calc_number(_eval_calc_node(node.args[0]))
-        if value < 0 or value != int(value):
-            raise ValueError("Факториал определён только для целых неотрицательных чисел")
-        if value > 500:
-            raise ValueError("Для безопасности факториал ограничен числом 500")
-        return float(math.factorial(int(value)))
-    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-            and node.func.id == "percent" and len(node.args) == 1 and not node.keywords:
-        return _PercentValue(_calc_number(_eval_calc_node(node.args[0])))
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)):
-        left = _eval_calc_node(node.left)
-        right = _eval_calc_node(node.right)
-        if isinstance(node.op, (ast.Add, ast.Sub)) and isinstance(right, _PercentValue):
-            if isinstance(left, _PercentValue):
-                lv, rv = left.value / 100.0, right.value / 100.0
-                return lv + rv if isinstance(node.op, ast.Add) else lv - rv
-            delta = float(left) * right.value / 100.0
-            return float(left) + delta if isinstance(node.op, ast.Add) else float(left) - delta
-        l, r = _calc_number(left), _calc_number(right)
-        if isinstance(node.op, ast.Add): return l + r
-        if isinstance(node.op, ast.Sub): return l - r
-        if isinstance(node.op, ast.Mult): return l * r
-        if isinstance(node.op, ast.Div):
-            if r == 0: raise ZeroDivisionError("Деление на ноль")
-            return l / r
-        if isinstance(node.op, ast.Mod):
-            if r == 0: raise ZeroDivisionError("Деление на ноль")
-            return l % r
-        if abs(r) > 1000:
-            raise ValueError("Показатель степени слишком большой")
-        return l ** r
-    raise ValueError("Недопустимое выражение")
-
-
-def calculate_expression_steps(expr):
-    """Возвращает результат и понятные промежуточные шаги для арифметики."""
-    original = (expr or "").strip()
-    normalized = original.replace(",", ".").replace("−", "-").replace("×", "*").replace("÷", "/").replace("•", "*").replace("⋅", "*")
-    normalized = normalized.replace("π", "pi").replace("°", "")
-    normalized = _calc_replace_brackets(normalized, "⌈", "⌉", "ceil")
-    normalized = _calc_replace_brackets(normalized, "⌊", "⌋", "floor")
-    normalized = normalized.replace("^", "**")
-    normalized = _calc_cbrt(normalized)
-    normalized = _calc_sqrt(normalized)
-    normalized = _calc_postfix(normalized, "!", "factorial")
-    normalized = _calc_postfix(normalized, "%", "percent")
-    tree = ast.parse(normalized, mode="eval")
-    steps = []
-
-    def walk(node):
-        if isinstance(node, ast.Expression):
-            return walk(node.body)
-        if isinstance(node, ast.BinOp):
-            left = walk(node.left)
-            right = walk(node.right)
-            l, r = _calc_number(left), _calc_number(right)
-            if isinstance(node.op, ast.Add):
-                value, symbol = l + r, "+"
-            elif isinstance(node.op, ast.Sub):
-                value, symbol = l - r, "−"
-            elif isinstance(node.op, ast.Mult):
-                value, symbol = l * r, "×"
-            elif isinstance(node.op, ast.Div):
-                if r == 0: raise ZeroDivisionError("Деление на ноль")
-                value, symbol = l / r, "÷"
-            elif isinstance(node.op, ast.Mod):
-                if r == 0: raise ZeroDivisionError("Деление на ноль")
-                value, symbol = l % r, "%"
-            elif isinstance(node.op, ast.Pow):
-                value, symbol = l ** r, "^"
+            result_set = sp.solveset(difference, variable, domain=sp.S.Reals)
+            if isinstance(result_set, sp.FiniteSet):
+                solutions = sorted(list(result_set), key=lambda v: float(sp.N(v)))
+                steps.append("2. Применяем символьный решатель в области действительных чисел.")
             else:
-                raise ValueError("Недопустимая операция")
-            steps.append(f"{format_number(l)} {symbol} {format_number(r)} = {format_number(value)}")
-            return value
-        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
-            value = _calc_number(walk(node.operand))
-            return value if isinstance(node.op, ast.UAdd) else -value
-        if isinstance(node, ast.Call):
-            # Reuse the existing safe evaluator for supported functions/special values.
-            value = _eval_calc_node(node)
-            steps.append(f"{ast.unparse(node)} = {format_number(_calc_number(value))}")
-            return value
-        return _eval_calc_node(node)
+                numeric = _numeric_roots(difference, variable)
+                solutions = [sp.Float(r, 12) for r in numeric]
+                steps.append("2. Закрытая формула не найдена; ищем действительные корни численно на отрезке [-100; 100].")
+    except Exception:
+        numeric = _numeric_roots(difference, variable)
+        solutions = [sp.Float(r, 12) for r in numeric]
+        steps.append("2. Используем численный поиск действительных корней на отрезке [-100; 100].")
 
-    result = walk(tree)
-    if isinstance(result, _PercentValue): result = result.value / 100.0
-    if not math.isfinite(float(result)):
-        raise ValueError("Результат не является конечным числом")
-    return float(result), steps
+    # Filter invalid/complex roots and verify candidates in original equation.
+    cleaned = []
+    for root in solutions or []:
+        try:
+            value = complex(sp.N(root, 14))
+            if abs(value.imag) > 1e-7 or not math.isfinite(value.real):
+                continue
+            residual = abs(float(sp.N(difference.subs(variable, value.real), 12)))
+            if residual < 1e-5 and all(abs(value.real-float(sp.N(old))) > 1e-5 for old in cleaned):
+                cleaned.append(sp.Float(value.real, 12))
+        except Exception:
+            # Keep exact symbolic roots if they can be verified symbolically.
+            if sp.simplify(difference.subs(variable, root)) == 0 and root not in cleaned:
+                cleaned.append(root)
+    cleaned.sort(key=lambda r: float(sp.N(r)))
+    if not cleaned:
+        result_text = "Действительные решения не найдены в проверенном диапазоне. Возможно, решений нет или численный поиск не смог их обнаружить."
+        steps.append("3. Проверяем кандидаты подстановкой; подтверждённых действительных корней не найдено.")
+    else:
+        shown_roots = cleaned[:12]
+        result_text = "Решение: " + "; ".join(f"{variable} ≈ {_calc_format(root, 14)}" for root in shown_roots)
+        steps.append("3. Проверяем найденные корни подстановкой в исходное уравнение.")
+        for root in shown_roots:
+            residual = sp.N(difference.subs(variable, root), 6)
+            steps.append(f"   x = {_calc_format(root, 12)}; невязка ≈ {_calc_format(abs(residual), 5)}.")
+        if len(cleaned) > 12:
+            steps.append(f"   Показаны первые 12 корней; в проверенном диапазоне найдено всего {len(cleaned)}.")
+    return result_text, steps
 
 
 def calculate_expression(expr):
+    """Evaluate a numeric expression or solve an equation if '=' is present."""
     expr = (expr or "").strip()
-    if not expr or len(expr) > 300 or not CALC_ALLOWED.fullmatch(expr):
-        raise ValueError("Недопустимое выражение")
-    expr = expr.replace(",", ".").replace("−", "-").replace("×", "*").replace("÷", "/").replace("•", "*").replace("⋅", "*")
-    expr = expr.replace("π", "pi").replace("°", "")
-    expr = _calc_replace_brackets(expr, "⌈", "⌉", "ceil")
-    expr = _calc_replace_brackets(expr, "⌊", "⌋", "floor")
-    expr = expr.replace("^", "**")
-    expr = _calc_cbrt(expr)
-    expr = _calc_sqrt(expr)
-    expr = _calc_postfix(expr, "!", "factorial")
-    expr = _calc_postfix(expr, "%", "percent")
-    tree = ast.parse(expr, mode="eval")
-    if sum(1 for _ in ast.walk(tree)) > 250:
-        raise ValueError("Слишком сложное выражение")
-    result = _eval_calc_node(tree)
-    if isinstance(result, _PercentValue):
-        result = result.value / 100.0
-    if not math.isfinite(float(result)):
-        raise ValueError("Результат не является конечным числом")
-    return result
+    if "=" in expr:
+        return solve_equation(expr, show_steps=False)
+    normalized = _normalize_calc_input(expr)
+    local_dict = dict(_CALC_LOCALS)
+    parsed = parse_expr(normalized, local_dict=local_dict, global_dict=_CALC_GLOBALS,
+                        transformations=_CALC_TRANSFORMATIONS, evaluate=True)
+    if parsed.free_symbols:
+        raise ValueError("Обнаружена неизвестная переменная. Для уравнения укажите знак =")
+    result = sp.N(parsed, 16)
+    if result.is_real is False:
+        return result
+    try:
+        value = float(result)
+        if not math.isfinite(value):
+            raise ValueError("Результат не является конечным числом")
+        return value
+    except (TypeError, OverflowError):
+        return result
+
 
 
 def _tc_formatted_text(result):
@@ -2724,7 +2590,7 @@ async def register_handlers():
             event, f"✅ Код <code>{code}</code> удалён из <b>promo_seen</b>."
         )
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:promosource|promopff)$"))
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.promosource$"))
     async def promosource_handler(event):
         """Sets the current chat as the source for promo announcements."""
         config["promo_source_chat"] = event.chat_id
@@ -2733,7 +2599,7 @@ async def register_handlers():
             event,
             "✅ <b>Источник промокодов подключён.</b>\n"
             f"ID чата: <code>{event.chat_id}</code>\n"
-            "Ищу сообщения вида <code>Пиши в боте: Промо [КОД]</code>. Команды <code>.promosource</code> и <code>.promopff</code> работают одинаково.",
+            "Ищу сообщения вида <code>Пиши в боте: Промо КОД</code>.",
         )
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.botimers$"))
@@ -3248,17 +3114,13 @@ async def register_handlers():
                 type(entity).__name__ == "MessageEntityCustomEmoji"
                 for entity in (response.entities or [])
             )
-            has_media = getattr(response, "media", None) is not None
-            if has_custom_emoji or has_media:
+            if has_custom_emoji:
                 # User-account send preserves custom emoji entities. This also
                 # avoids the Bot API Premium requirement for custom emoji.
                 sent = await publish_evo_direct(
                     response, event.chat_id, reply_to=reply_to
                 )
-                logger.info("[EVO] Direct send preserving entities/media: message_id=%s", sent.id)
-                direct_link = direct_evo_messages.get((sent.chat_id, sent.id))
-                if direct_link and (response.raw_text or "").strip().lower().startswith("ожидайте"):
-                    asyncio.create_task(watch_evo_followup(response, direct_link, direct=True))
+                logger.info("[EVO] Direct send with custom emoji: message_id=%s", sent.id)
             else:
                 data, callback_links = _message_to_helper_data(
                     response, event.chat_id
@@ -3269,14 +3131,10 @@ async def register_handlers():
                     "destination_chat": event.chat_id,
                     "callback_links": callback_links,
                 }
-                sent, token = await publish_through_helper(
+                await publish_through_helper(
                     data, event.chat_id, reply_to=reply_to,
                     source_link=source_link
                 )
-                if (response.raw_text or "").strip().lower().startswith("ожидайте"):
-                    link = inline_reply_links.get((sent.chat_id, sent.id))
-                    if link:
-                        asyncio.create_task(watch_evo_followup(response, link, direct=False))
             await event.delete()
         except Exception as exc:
             logger.exception("Ошибка .evo")
@@ -3389,107 +3247,43 @@ async def register_handlers():
 
 
     @client.on(events.NewMessage(
-        outgoing=True, pattern=r"^\.calc(?: (.*))?$"
+        outgoing=True, pattern=r"^\.calc(?:\s+(all\b)?\s*(.*))?$"
     ))
     async def calc_handler(event):
-        expr = (event.pattern_match.group(1) or "").strip()
-        show_steps = False
-        replied_example = False
-
-        # Подробный режим: .calc all выражение. Поддерживаем также
-        # .calc all в ответ на сообщение с выражением.
-        mode_match = re.match(r"^(all|подробно|шаги|steps)(?:\s+(.*))?$", expr, re.IGNORECASE | re.DOTALL)
-        if mode_match:
-            show_steps = True
-            expr = (mode_match.group(2) or "").strip()
-
+        all_mode = bool(event.pattern_match.group(1))
+        expr = (event.pattern_match.group(2) or "").strip()
         if not expr and event.is_reply:
-            try:
-                replied = await event.get_reply_message()
-                expr = (getattr(replied, "raw_text", None) or "").strip()
-                replied_example = True
-                # Allow replying to a message that already contains the command.
-                if expr.lower().startswith(".calc"):
-                    expr = expr[5:].strip()
-                # A replied-to example may itself start with the detailed-mode word.
-                mode_match = re.match(r"^(all|подробно|шаги|steps)(?:\s+(.*))?$", expr, re.IGNORECASE | re.DOTALL)
-                if mode_match:
-                    show_steps = True
-                    expr = (mode_match.group(2) or "").strip()
-            except Exception:
-                expr = ""
-                replied_example = True
-        if not expr and not replied_example and show_steps:
-            return await answer_and_delete(
-                event,
-                "ℹ️ Используй <code>.calc all выражение</code> или ответь командой <code>.calc all</code> на сообщение с выражением.",
-            )
-        if not expr and not replied_example:
-            help_text = (
-                "<b>🧮 Калькулятор .calc</b>\n"
-                "Отправь <code>.calc выражение</code>. Для подробного решения используй <code>.calc all выражение</code> (также работают <code>.calc подробно</code>, <code>.calc шаги</code> и <code>.calc steps</code>).\n"
-                "Обозначения можно копировать из отдельных блоков ниже.\n\n"
-                "<b>1. Операции</b>\n"
-                "<pre><code>+  −  *  /  ×  ÷  ^</code></pre>"
-                "+ сложение; − вычитание; × или * умножение; ÷ или / деление; ^ степень.\n"
-                "<code>.calc 2^3</code> → 8\n<code>.calc 2^-3</code> → 0,125\n\n"
-                "<b>2. Корень, проценты и факториал</b>\n"
-                "<pre><code>√  %  !</code></pre>"
-                "√ — квадратный корень; % — процент; ! — факториал.\n"
-                "<code>.calc √16</code> → 4\n<code>.calc √(16/4)</code> → 2\n"
-                "<code>.calc 5!</code> → 120\n<code>.calc 15%</code> → 0,15\n\n"
-                "<b>3. Числа и скобки</b>\n"
-                "<pre><code>π  e  ( )  °</code></pre>"
-                "π — число Пи; e — число Эйлера; скобки задают порядок; ° отмечает градусы и не меняет числовое значение угла.\n"
-                "Десятичные числа можно писать через точку или запятую: <code>1.5</code> или <code>1,5</code>. Отрицательные числа поддерживаются.\n"
-                "<code>.calc (2+3)×4</code> → 20\n\n"
-                "<b>4. Функции</b>\n"
-                "<pre><code>sqrt(x)  log(x)  ln(x)  abs(x)</code></pre>"
-                "sqrt(x) — корень; log(x) — десятичный логарифм; ln(x) — натуральный логарифм; abs(x) — модуль числа.\n"
-                "<code>.calc log(100)</code> → 2\n<code>.calc ln(e)</code> → 1\n<code>.calc abs(-5)</code> → 5\n\n"
-                "<b>5. Округление</b>\n"
-                "<pre><code>⌈x⌉  ⌊x⌋  ceil(x)  floor(x)  round(x)</code></pre>"
-                "⌈x⌉ / ceil(x) — вверх; ⌊x⌋ / floor(x) — вниз; round(x) — математическое округление.\n"
-                "<code>.calc ⌈2.1⌉</code> → 3\n<code>.calc ⌊2.9⌋</code> → 2\n<code>.calc round(2.5)</code> → 3\n\n"
-                "<b>6. Примеры сочетаний</b>\n"
-                "<pre><code>(1/2)^-2\n6,67×10^-11×2×10^30/(7×10^8)^2</code></pre>"
-                "Скобки, дроби, степени, корни и округление можно комбинировать. Приоритет операций стандартный: скобки → степени → умножение/деление → сложение/вычитание."
-            )
-            return await answer_and_delete(event, help_text)
-        # If the command is a reply, the mode may be in the command itself
-        # (.calc all) or at the beginning of the replied-to example.
-        if replied_example and expr:
-            for prefix in ("all ", "подробно ", "шаги ", "steps "):
-                if expr.lower().startswith(prefix):
-                    show_steps = True
-                    expr = expr[len(prefix):].strip()
-                    break
+            replied = await event.get_reply_message()
+            expr = (replied.raw_text or "").strip() if replied else ""
+            if expr.lower().startswith(".calc"):
+                expr = expr[5:].strip()
         if not expr:
             return await answer_and_delete(
-                event,
-                "⚠️ Пример не распознан. Ответь командой .calc на сообщение с математическим выражением.",
+                event, "⚠️ Формат: <code>.calc 2+2*5</code> или <code>.calc all уравнение</code>"
             )
         try:
-            if show_steps:
-                result, steps = calculate_expression_steps(expr)
-                # Show a compact trace while preserving the final answer.
-                unique_steps = list(dict.fromkeys(steps))
-                detail = "\n".join(
-                    f"{i}. <code>{step}</code>" for i, step in enumerate(unique_steps, 1)
-                )
-                if len(detail) > 2800:
-                    detail = detail[:2750] + "\n…"
-                body = (f"<b>🧮 Решение по шагам</b>\n<code>{expr}</code>\n\n"
-                        f"{detail}\n\n<b>Ответ: {format_number(float(result))}</b>")
+            if "=" in expr:
+                result_text, steps = solve_equation(expr, show_steps=all_mode)
+                output = f"<code>{expr}</code>\n<b>{result_text}</b>"
+                if all_mode:
+                    output += "\n\n<b>Пошаговое решение:</b>\n" + "\n".join(steps)
             else:
                 result = calculate_expression(expr)
-                body = f"<code>{expr}</code> = <b>{format_number(float(result))}</b>"
-            await event.edit(body)
+                if isinstance(result, tuple):
+                    result_text, steps = result
+                    output = f"<code>{expr}</code>\n<b>{result_text}</b>"
+                    if all_mode:
+                        output += "\n\n<b>Пошаговое решение:</b>\n" + "\n".join(steps)
+                else:
+                    formatted = _calc_format(result)
+                    output = f"<code>{expr}</code> = <b>{formatted}</b>"
+                    if all_mode:
+                        output += f"\n\n<b>Шаги:</b>\n1. Разбираем выражение с учётом приоритета операций.\n2. Выполняем математические операции.\n3. Получаем результат: <b>{formatted}</b>."
+            await event.edit(output[:3900], parse_mode="html")
         except Exception as exc:
-            logger.debug(".calc не распознал выражение %r: %s", expr, exc)
+            logger.info(".calc failed (%s)", type(exc).__name__)
             await answer_and_delete(
-                event,
-                "⚠️ Пример не распознан или содержит неподдерживаемые символы.",
+                event, "⚠️ Не удалось решить выражение. Проверьте запись и область определения. Для пошагового решения используйте <code>.calc all ...</code>."
             )
 
     @client.on(events.NewMessage(outgoing=True))
