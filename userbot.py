@@ -396,13 +396,25 @@ async def publish_evo_direct(response, destination_chat, reply_to=None):
     buttons, callback_keys = _direct_evo_buttons(
         response, destination_chat, destination_message_id=None
     )
-    sent = await client.send_message(
-        destination_chat,
-        response.raw_text or "",
-        formatting_entities=response.entities or [],
-        buttons=buttons,
-        reply_to=reply_to,
-    )
+    if getattr(response, "media", None) is not None:
+        # Media responses must be sent through the user account: Telegram's
+        # inline-article API cannot carry arbitrary photos/videos/documents/GIFs.
+        sent = await client.send_file(
+            destination_chat,
+            response.media,
+            caption=response.raw_text or "",
+            formatting_entities=response.entities or [],
+            buttons=buttons,
+            reply_to=reply_to,
+        )
+    else:
+        sent = await client.send_message(
+            destination_chat,
+            response.raw_text or "",
+            formatting_entities=response.entities or [],
+            buttons=buttons,
+            reply_to=reply_to,
+        )
     for key in callback_keys:
         direct_evo_callbacks[key]["destination_message_id"] = sent.id
     direct_evo_messages[(sent.chat_id, sent.id)] = {
@@ -429,13 +441,34 @@ async def _refresh_direct_evo_message(link):
     buttons, callback_keys = _direct_evo_buttons(
         source, link["destination_chat"], link["destination_message_id"]
     )
-    await client.edit_message(
-        link["destination_chat"],
-        link["destination_message_id"],
-        source.raw_text or "",
-        formatting_entities=source.entities or [],
-        buttons=buttons,
-    )
+    if getattr(source, "media", None) is not None:
+        # Telegram cannot change a text message into a media message by editing.
+        # For an existing media message, update its caption/media when supported;
+        # otherwise replace it with the new media while keeping its callback map.
+        try:
+            await client.edit_message(
+                link["destination_chat"], link["destination_message_id"],
+                source.raw_text or "", file=source.media,
+                formatting_entities=source.entities or [], buttons=buttons,
+            )
+        except Exception:
+            await client.delete_messages(
+                link["destination_chat"], [link["destination_message_id"]]
+            )
+            sent = await client.send_file(
+                link["destination_chat"], source.media,
+                caption=source.raw_text or "",
+                formatting_entities=source.entities or [], buttons=buttons,
+            )
+            link["destination_message_id"] = sent.id
+    else:
+        await client.edit_message(
+            link["destination_chat"],
+            link["destination_message_id"],
+            source.raw_text or "",
+            formatting_entities=source.entities or [],
+            buttons=buttons,
+        )
     link["callback_keys"] = set(callback_keys)
     direct_evo_messages[(link["destination_chat"], link["destination_message_id"])] = link
     return source
@@ -464,6 +497,53 @@ async def publish_through_helper(data, destination_chat, reply_to=None,
             }
         inline_reply_links[(sent.chat_id, sent.id)] = link
     return sent, token
+
+
+async def watch_evo_followup(wait_response, destination_link, direct=False, timeout=90.0):
+    """If MineEVO first says «Ожидайте…», update the same result on follow-up."""
+    text = (wait_response.raw_text or "").strip().lower()
+    if not text.startswith("ожидайте"):
+        return
+    source_chat = wait_response.chat_id
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+        try:
+            messages = await client.get_messages(source_chat, limit=30)
+        except Exception:
+            continue
+        candidates = sorted(
+            (m for m in messages if m.id > wait_response.id and not m.out),
+            key=lambda m: m.id,
+        )
+        if not candidates:
+            continue
+        final = candidates[0]
+        # Ignore further progress notices and wait for the actual result.
+        if (final.raw_text or "").strip().lower().startswith("ожидайте"):
+            wait_response = final
+            continue
+        try:
+            destination_link["source_chat"] = final.chat_id
+            destination_link["source_message_id"] = final.id
+            if direct:
+                await _refresh_direct_evo_message(destination_link)
+            else:
+                token = destination_link.get("helper_token")
+                inline_id = helper_inline_ids.get(token)
+                for _ in range(20):
+                    if inline_id:
+                        break
+                    await asyncio.sleep(0.25)
+                    inline_id = helper_inline_ids.get(token)
+                if inline_id and getattr(final, "media", None) is None:
+                    await update_helper_inline_message(final, destination_link, inline_id)
+                elif getattr(final, "media", None) is not None:
+                    logger.warning("[EVO] Follow-up result contains media; inline text message cannot be converted to media in-place")
+            return
+        except Exception:
+            logger.exception("[EVO] Не удалось обновить результат после «Ожидайте»")
+            return
 
 
 async def update_helper_inline_message(response, link, inline_message_id):
@@ -587,11 +667,14 @@ async def helper_inline_chosen(request):
         return web.json_response({"ok": False, "error": "bad_request"}, status=400)
 
 
-async def ask_mineevo(text, timeout=5.0, internal=False, chat_id=None):
-    """Отправляет запрос MineEVO и ждёт именно его ответ.
+async def ask_mineevo(text, timeout=30.0, internal=False, chat_id=None):
+    """Отправляет запрос MineEVO и ловит ближайшее входящее сообщение.
 
-    chat_id позволяет тем же механизмом работать как в рабочей группе,
-    так и в личке MineEVO во время боя.
+    MineEVO не всегда оформляет ответ как reply и в группах сообщение
+    может приходить без признака sender.bot. Поэтому сначала проверяем
+    reply на наш запрос, а если его нет — берём самое раннее входящее
+    сообщение, появившееся после отправки запроса в этом же чате.
+    Общая блокировка не даёт параллельным командам перепутать ответы.
     """
     if not text:
         return None
@@ -601,38 +684,65 @@ async def ask_mineevo(text, timeout=5.0, internal=False, chat_id=None):
 
     async with ask_mineevo_lock:
         sent = await client.send_message(target_chat, text)
-        logger.info("[MINE] отправлено: %r (chat=%s, message_id=%s)", text, target_chat, sent.id)
+        logger.info(
+            "[MINE] запрос отправлен (chat_id=%s, message_id=%s)",
+            target_chat, sent.id
+        )
         deadline = asyncio.get_running_loop().time() + timeout
+        first_incoming = None
         while asyncio.get_running_loop().time() < deadline:
-            await asyncio.sleep(0.20)
-            messages = await client.get_messages(target_chat, limit=30)
-            after = []
-            for msg in messages:
-                if msg.id <= sent.id or msg.out:
-                    continue
-                try:
-                    sender = await msg.get_sender()
-                    if sender is None or not getattr(sender, "bot", False):
-                        continue
-                except Exception:
-                    continue
-                after.append(msg)
-
-            if not after:
+            await asyncio.sleep(0.2)
+            try:
+                messages = await client.get_messages(target_chat, limit=100)
+            except Exception as exc:
+                logger.warning(
+                    "[MINE] не удалось прочитать историю чата: %s",
+                    type(exc).__name__
+                )
                 continue
 
-            # Самый надёжный вариант — ответ MineEVO с reply_to на наш запрос.
-            for msg in after:
+            incoming = sorted(
+                (msg for msg in messages if msg.id > sent.id and not msg.out),
+                key=lambda msg: msg.id,
+            )
+            if not incoming:
+                continue
+
+            # Reply на конкретный запрос всегда приоритетнее обычного сообщения.
+            for msg in incoming:
                 reply = getattr(msg, "reply_to", None)
-                reply_id = getattr(reply, "reply_to_msg_id", None)
-                if reply_id == sent.id:
+                if getattr(reply, "reply_to_msg_id", None) == sent.id:
+                    logger.info(
+                        "[MINE] найден reply на запрос (message_id=%s)", msg.id
+                    )
                     return msg
 
-            # Fallback для MineEVO, который не использует reply_to: берём
-            # самое свежее сообщение бота после нашего запроса.
-            return max(after, key=lambda m: m.id)
+            # Если reply отсутствует, MineEVO обычно присылает отдельное
+            # сообщение сразу после команды. Не фильтруем sender.bot:
+            # в группах Telegram иногда возвращает отправителя без этого флага.
+            if first_incoming is None:
+                first_incoming = incoming[0]
+                first_seen_at = asyncio.get_running_loop().time()
+                logger.info(
+                    "[MINE] найдено обычное входящее сообщение после запроса "
+                    "(message_id=%s); проверяю возможный reply",
+                    first_incoming.id
+                )
 
-    raise TimeoutError(f"MineEVO не ответил в течение {timeout:g} секунд")
+            # Даём короткий интервал, чтобы не пропустить reply, который
+            # появился почти одновременно с обычным сообщением.
+            if asyncio.get_running_loop().time() - first_seen_at >= 0.6:
+                logger.info(
+                    "[MINE] используем ближайшее входящее сообщение "
+                    "без reply (message_id=%s)", first_incoming.id
+                )
+                return first_incoming
+
+    raise TimeoutError(
+        f"В чате MineEVO ({target_chat}) не найдено новое входящее сообщение "
+        f"за {timeout:g} с после отправки запроса. "
+        "Проверьте .work и убедитесь, что MineEVO отвечает в этом чате."
+    )
 
 
 def parse_promo_codes(text):
@@ -719,7 +829,7 @@ async def promo_send_and_wait(code, timeout=15.0):
     Используется общий ask_mineevo(), поэтому промо не перехватывает ответы
     других автоматизаций MineEVO и наоборот.
     """
-    text = f"промо {code}"
+    text = f"промо [{code}]"
     response = await ask_mineevo(text, timeout=timeout)
     logger.info(
         "[PROMO] отправлено обычным текстом в Work: %r; ответ получен=%s",
@@ -728,7 +838,7 @@ async def promo_send_and_wait(code, timeout=15.0):
     return response
 
 
-async def promo_activate_code(code, attempts=3):
+async def promo_activate_code(code, attempts=1):
     """Отправляет промо-код обычным текстом и ждёт ответ MineEVO."""
     async with promo_lock:
         for attempt in range(1, attempts + 1):
@@ -1357,7 +1467,7 @@ def make_tc_output(template_text, target_names, quantity=1.0):
     )
 
 
-CALC_ALLOWED = re.compile(r"^[0-9A-Za-z_+\-*/().,%\s×÷•√^!π°⌈⌉⌊⌋]+$")
+CALC_ALLOWED = re.compile(r"^[0-9A-Za-z_+\-*/().,%\s×÷•⋅√∛^!π°−⌈⌉⌊⌋]+$")
 
 
 class _PercentValue:
@@ -1445,6 +1555,39 @@ def _calc_postfix(expr, symbol, function):
     return expr
 
 
+def _calc_cbrt(expr):
+    """Поддерживает кубический корень: ∛64 и ∛(выражение)."""
+    while '∛' in expr:
+        pos = expr.rfind('∛')
+        i = pos + 1
+        while i < len(expr) and expr[i].isspace():
+            i += 1
+        if i >= len(expr):
+            raise ValueError("После ∛ требуется выражение")
+        if expr[i] == '(':
+            depth = 0
+            close = None
+            for j in range(i, len(expr)):
+                if expr[j] == '(':
+                    depth += 1
+                elif expr[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        close = j
+                        break
+            if close is None:
+                raise ValueError("Несбалансированные скобки")
+            operand = expr[i:close + 1]
+            expr = expr[:pos] + f"cbrt({operand})" + expr[close + 1:]
+        else:
+            match = re.match(r"(?:\d+(?:\.\d*)?|\.\d+|[A-Za-z_]+|π)", expr[i:])
+            if not match:
+                raise ValueError("После ∛ требуется число или скобки")
+            operand = match.group(0)
+            expr = expr[:pos] + f"cbrt({operand})" + expr[i + len(operand):]
+    return expr
+
+
 def _calc_sqrt(expr):
     """Поддерживает √16, √(16/4) и вложенные скобки."""
     while '√' in expr:
@@ -1492,7 +1635,7 @@ def _eval_calc_node(node):
             return _PercentValue(-value.value if isinstance(node.op, ast.USub) else value.value)
         return +value if isinstance(node.op, ast.UAdd) else -value
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
-            and node.func.id in {"sqrt", "log", "ln", "abs", "ceil", "floor", "round"} \
+            and node.func.id in {"sqrt", "cbrt", "log", "ln", "abs", "ceil", "floor", "round"} \
             and len(node.args) == 1 and not node.keywords:
         name = node.func.id
         value = _calc_number(_eval_calc_node(node.args[0]))
@@ -1500,6 +1643,8 @@ def _eval_calc_node(node):
             if value < 0:
                 raise ValueError("Корень из отрицательного числа")
             return math.sqrt(value)
+        if name == "cbrt":
+            return math.copysign(abs(value) ** (1.0 / 3.0), value)
         if name == "log":
             if value <= 0:
                 raise ValueError("log определён только для положительных чисел")
@@ -1551,11 +1696,12 @@ def _eval_calc_node(node):
 def calculate_expression_steps(expr):
     """Возвращает результат и понятные промежуточные шаги для арифметики."""
     original = (expr or "").strip()
-    normalized = original.replace(",", ".").replace("×", "*").replace("÷", "/").replace("•", "*")
+    normalized = original.replace(",", ".").replace("−", "-").replace("×", "*").replace("÷", "/").replace("•", "*").replace("⋅", "*")
     normalized = normalized.replace("π", "pi").replace("°", "")
     normalized = _calc_replace_brackets(normalized, "⌈", "⌉", "ceil")
     normalized = _calc_replace_brackets(normalized, "⌊", "⌋", "floor")
     normalized = normalized.replace("^", "**")
+    normalized = _calc_cbrt(normalized)
     normalized = _calc_sqrt(normalized)
     normalized = _calc_postfix(normalized, "!", "factorial")
     normalized = _calc_postfix(normalized, "%", "percent")
@@ -1608,11 +1754,12 @@ def calculate_expression(expr):
     expr = (expr or "").strip()
     if not expr or len(expr) > 300 or not CALC_ALLOWED.fullmatch(expr):
         raise ValueError("Недопустимое выражение")
-    expr = expr.replace(",", ".").replace("×", "*").replace("÷", "/").replace("•", "*")
+    expr = expr.replace(",", ".").replace("−", "-").replace("×", "*").replace("÷", "/").replace("•", "*").replace("⋅", "*")
     expr = expr.replace("π", "pi").replace("°", "")
     expr = _calc_replace_brackets(expr, "⌈", "⌉", "ceil")
     expr = _calc_replace_brackets(expr, "⌊", "⌋", "floor")
     expr = expr.replace("^", "**")
+    expr = _calc_cbrt(expr)
     expr = _calc_sqrt(expr)
     expr = _calc_postfix(expr, "!", "factorial")
     expr = _calc_postfix(expr, "%", "percent")
@@ -2577,6 +2724,18 @@ async def register_handlers():
             event, f"✅ Код <code>{code}</code> удалён из <b>promo_seen</b>."
         )
 
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.(?:promosource|promopff)$"))
+    async def promosource_handler(event):
+        """Sets the current chat as the source for promo announcements."""
+        config["promo_source_chat"] = event.chat_id
+        save_config()
+        await answer_and_delete(
+            event,
+            "✅ <b>Источник промокодов подключён.</b>\n"
+            f"ID чата: <code>{event.chat_id}</code>\n"
+            "Ищу сообщения вида <code>Пиши в боте: Промо [КОД]</code>. Команды <code>.promosource</code> и <code>.promopff</code> работают одинаково.",
+        )
+
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.botimers$"))
     async def botimers_handler(event):
         """Starts passive observation; never presses/selects boss-menu buttons."""
@@ -3079,7 +3238,7 @@ async def register_handlers():
             )
         try:
             # MineEVO can respond slower than the default short polling window.
-            response = await ask_mineevo(args, timeout=15.0, chat_id=config["mine_work_chat"])
+            response = await ask_mineevo(args, timeout=30.0, chat_id=config["mine_work_chat"])
             if response is None:
                 return await answer_and_delete(
                     event, "⚠️ MineEVO не ответил."
@@ -3089,13 +3248,17 @@ async def register_handlers():
                 type(entity).__name__ == "MessageEntityCustomEmoji"
                 for entity in (response.entities or [])
             )
-            if has_custom_emoji:
+            has_media = getattr(response, "media", None) is not None
+            if has_custom_emoji or has_media:
                 # User-account send preserves custom emoji entities. This also
                 # avoids the Bot API Premium requirement for custom emoji.
                 sent = await publish_evo_direct(
                     response, event.chat_id, reply_to=reply_to
                 )
-                logger.info("[EVO] Direct send with custom emoji: message_id=%s", sent.id)
+                logger.info("[EVO] Direct send preserving entities/media: message_id=%s", sent.id)
+                direct_link = direct_evo_messages.get((sent.chat_id, sent.id))
+                if direct_link and (response.raw_text or "").strip().lower().startswith("ожидайте"):
+                    asyncio.create_task(watch_evo_followup(response, direct_link, direct=True))
             else:
                 data, callback_links = _message_to_helper_data(
                     response, event.chat_id
@@ -3106,15 +3269,26 @@ async def register_handlers():
                     "destination_chat": event.chat_id,
                     "callback_links": callback_links,
                 }
-                await publish_through_helper(
+                sent, token = await publish_through_helper(
                     data, event.chat_id, reply_to=reply_to,
                     source_link=source_link
                 )
+                if (response.raw_text or "").strip().lower().startswith("ожидайте"):
+                    link = inline_reply_links.get((sent.chat_id, sent.id))
+                    if link:
+                        asyncio.create_task(watch_evo_followup(response, link, direct=False))
             await event.delete()
-        except Exception:
+        except Exception as exc:
             logger.exception("Ошибка .evo")
+            # Показываем понятную причину: раньше ошибки ожидания ответа и
+            # ошибки Helper Bot отображались одинаково, поэтому их нельзя
+            # было отличить при настройке.
+            safe_reason = str(exc).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            if len(safe_reason) > 350:
+                safe_reason = safe_reason[:347] + "..."
             await event.edit(
-                "⚠️ <b>Не удалось получить ответ MineEVO.</b>"
+                "⚠️ <b>Ошибка .evo:</b> "
+                f"<code>{type(exc).__name__}</code> — {safe_reason}"
             )
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.tcset$"))
@@ -3220,12 +3394,15 @@ async def register_handlers():
     async def calc_handler(event):
         expr = (event.pattern_match.group(1) or "").strip()
         show_steps = False
-        for prefix in ("all ", "подробно ", "шаги ", "steps "):
-            if expr.lower().startswith(prefix):
-                show_steps = True
-                expr = expr[len(prefix):].strip()
-                break
         replied_example = False
+
+        # Подробный режим: .calc all выражение. Поддерживаем также
+        # .calc all в ответ на сообщение с выражением.
+        mode_match = re.match(r"^(all|подробно|шаги|steps)(?:\s+(.*))?$", expr, re.IGNORECASE | re.DOTALL)
+        if mode_match:
+            show_steps = True
+            expr = (mode_match.group(2) or "").strip()
+
         if not expr and event.is_reply:
             try:
                 replied = await event.get_reply_message()
@@ -3234,9 +3411,19 @@ async def register_handlers():
                 # Allow replying to a message that already contains the command.
                 if expr.lower().startswith(".calc"):
                     expr = expr[5:].strip()
+                # A replied-to example may itself start with the detailed-mode word.
+                mode_match = re.match(r"^(all|подробно|шаги|steps)(?:\s+(.*))?$", expr, re.IGNORECASE | re.DOTALL)
+                if mode_match:
+                    show_steps = True
+                    expr = (mode_match.group(2) or "").strip()
             except Exception:
                 expr = ""
                 replied_example = True
+        if not expr and not replied_example and show_steps:
+            return await answer_and_delete(
+                event,
+                "ℹ️ Используй <code>.calc all выражение</code> или ответь командой <code>.calc all</code> на сообщение с выражением.",
+            )
         if not expr and not replied_example:
             help_text = (
                 "<b>🧮 Калькулятор .calc</b>\n"
@@ -3269,6 +3456,14 @@ async def register_handlers():
                 "Скобки, дроби, степени, корни и округление можно комбинировать. Приоритет операций стандартный: скобки → степени → умножение/деление → сложение/вычитание."
             )
             return await answer_and_delete(event, help_text)
+        # If the command is a reply, the mode may be in the command itself
+        # (.calc all) or at the beginning of the replied-to example.
+        if replied_example and expr:
+            for prefix in ("all ", "подробно ", "шаги ", "steps "):
+                if expr.lower().startswith(prefix):
+                    show_steps = True
+                    expr = expr[len(prefix):].strip()
+                    break
         if not expr:
             return await answer_and_delete(
                 event,
@@ -3427,7 +3622,7 @@ async def register_handlers():
 
         text = event.raw_text or ""
         match = re.search(
-            r"пиши\s+в\s+боте\s*:\s*промо\s+(\S+)",
+            r"пиши\s+в\s+боте\s*:\s*промо\s+\[?([^\]\s]+)\]?",
             text,
             re.IGNORECASE,
         )
