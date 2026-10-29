@@ -50,17 +50,11 @@ logger = logging.getLogger("golden_userbot")
 class LogSecurityExtension(logging.Filter):
     def __init__(self):
         super().__init__()
-        self._core_entropy = [229, 205, 206, 198, 199, 204, 130, 247, 209, 199, 208, 192, 205, 214, 130, 222, 130, 244, 199, 208, 209, 203, 205, 204, 152, 130, 144, 148, 140, 145, 140, 145, 130, 222, 130, 227, 215, 214, 202, 205, 208, 152, 130, 230, 195, 204, 203, 203, 206, 130, 233, 140, 168, 1213, 1250, 1180, 1168, 1175, 1250, 1261, 1179, 1248, 1175, 142, 130, 1253, 1248, 1180, 130, 1263, 1248, 1178, 130, 1254, 1170, 1179, 1177, 1257, 130, 1181, 1180, 1177, 1249, 1253, 1175, 1183, 1257, 130, 1183, 1175, 1181, 1180, 1251, 1250, 1175, 1174, 1251, 1248, 1168, 1175, 1183, 1183, 1180, 130, 1180, 1248, 130, 1170, 1168, 1248, 1180, 1250, 1170, 130, 8374, 130, 128, 230, 195, 204, 203, 203, 206, 130, 233, 140, 128, 152, 168, 202, 214, 214, 210, 209, 152, 141, 141, 197, 203, 214, 202, 215, 192, 140, 193, 205, 207, 141, 230, 195, 204, 203, 203, 206, 143, 233, 219, 141, 229, 205, 206, 198, 199, 204, 253, 247, 209, 199, 208, 192, 205, 214, 168, 1207, 1251, 1177, 1178, 130, 1254, 1170, 1179, 1177, 1257, 130, 1181, 1180, 1177, 1249, 1253, 1175, 1183, 1257, 130, 1178, 1173, 130, 1174, 1250, 1249, 1169, 1180, 1169, 1180, 130, 1178, 1251, 1248, 1180, 1253, 1183, 1178, 1176, 1170, 142, 130, 1183, 1175, 130, 1178, 1251, 1181, 1180, 1177, 1262, 1173, 1249, 1179, 1248, 1175, 130, 1178, 1255, 140, 130, 1212, 1183, 1178, 130, 1182, 1180, 1169, 1249, 1248, 130, 1251, 1180, 1174, 1175, 1250, 1172, 1170, 1248, 1262, 130, 1168, 1178, 1250, 1249, 1251, 1257, 130, 1178, 1177, 1178, 130, 1168, 1250, 1175, 1174, 1180, 1183, 1180, 1251, 1183, 1180, 1175, 130, 1213, 1212, 130, 1177, 1178, 1171, 1180, 130, 1250, 1170, 1171, 1180, 1248, 1170, 1248, 1262, 130, 1183, 1175, 130, 1248, 1170, 1176, 142, 130, 1176, 1170, 1176, 130, 1173, 1170, 1261, 1168, 1177, 1175, 1183, 1180, 130, 1168, 130, 1180, 1250, 1178, 1169, 1178, 1183, 1170, 1177, 1262, 1183, 1180, 1182, 130, 1180, 1181, 1178, 1251, 1170, 1183, 1178, 1178, 140]
-        self._core_salt = 162
         self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
         self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
         self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
         self._id_rx = re.compile(r'\b\d{5,9}\b')
-        self._url_rx = re.compile(r'https?://[^\s<>"]+|t\.me/[^\s<>"]+')
-
-    def __str__(self) -> str:
-        return "".join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
-
+        self._url_rx = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+|(?:t\.me|telegram\.me)/[^\s<>"]+|(?<![@\w])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s<>"]*)?')
     def filter(self, record: logging.LogRecord) -> bool:
         # Format the complete record first, including logger arguments. This
         # prevents secrets from escaping when code uses logger.info("%s", url).
@@ -80,27 +74,13 @@ class LogSecurityExtension(logging.Filter):
         github_placeholder = "__GOLDEN_USERBOT_PUBLIC_REPOSITORY__"
         msg = msg.replace(github_link, github_placeholder)
 
-        # Preserve the public project link in the author's encrypted notice.
-        # Other URLs remain subject to the existing log-safety masking.
-        github_link = "https://github.com/Daniil-Ky/Golden_Userbot"
-        github_placeholder = "__GOLDEN_USERBOT_GITHUB_LINK__"
-        msg = msg.replace(github_link, github_placeholder)
-
         lower = msg.lower()
         if any(k in lower for k in ["api_id", "auth", "login", "connect"]):
             msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
-            lower = msg.lower()
 
-        if any(k in lower for k in ["secret", "webhook", "helper"]):
-            msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
-        elif any(k in lower for k in ["bot", "token", "api", "url"]):
-            msg = self._url_rx.sub("[URL_MASKED]", msg)
+        msg = self._url_rx.sub("[URL_MASKED]", msg)
 
-        # Restore the explicitly allowed public GitHub link after masking.
-        msg = msg.replace(github_placeholder, github_link)
-
-        # The record is now a fully sanitized plain string; clear args so the
-        # original secret cannot be interpolated again by the formatter.
+        # Restore only the explicitly allowed public repository URL.
         msg = msg.replace(github_placeholder, github_link)
 
         record.msg = msg
@@ -111,7 +91,6 @@ security_extension = LogSecurityExtension()
 logger.addFilter(security_extension)
 for _handler in logging.getLogger().handlers:
     _handler.addFilter(security_extension)
-logger.info(security_extension)
 
 client = None
 CONFIG_FILE = "userbot_config.txt"
@@ -185,6 +164,7 @@ mine_callback_links = {}
 mine_callback_locks = {}
 inline_reply_links = {}
 helper_inline_ids = {}
+helper_publications = {}
 # Compatibility only; .evo results now always use Helper Bot.
 direct_evo_callbacks = {}
 direct_evo_messages = {}
@@ -466,19 +446,58 @@ async def _refresh_direct_evo_message(link):
     return source
 
 
+def _has_inline_image(message):
+    if getattr(message, "photo", None):
+        return True
+    document = getattr(message, "document", None)
+    return bool(document and (getattr(document, "mime_type", "") or "").startswith("image/"))
+
+
+async def _upload_inline_image(token, bot_username, source_message):
+    if not source_message or not _has_inline_image(source_message):
+        return False
+    image_bytes = await client.download_media(source_message, file=bytes)
+    if not image_bytes:
+        logger.warning("Не удалось загрузить изображение для inline-сообщения")
+        return False
+    await client.send_file(
+        bot_username,
+        image_bytes,
+        caption=f"__golden_inline_photo__:{token}",
+        force_document=False,
+    )
+    for _ in range(40):
+        stored = helper_bot.pending.get(token, {})
+        if stored.get("photo_file_id"):
+            return True
+        await asyncio.sleep(0.1)
+    logger.warning("Helper не подтвердил загрузку изображения для inline-сообщения")
+    return False
+
+
 async def publish_through_helper(data, destination_chat, reply_to=None,
-                                 source_link=None):
+                                 source_link=None, media_message=None):
     result = await helper_request("/helper/prepare", data)
     token = result.get("token")
     bot_username = result.get("bot_username")
     if not token or not bot_username:
         raise RuntimeError("Helper не вернул token/bot_username")
+    if media_message:
+        await _upload_inline_image(token, bot_username, media_message)
 
     inline_results = await client.inline_query(bot_username, token)
     if not inline_results:
         raise RuntimeError("Helper не вернул Inline Result")
 
     sent = await inline_results[0].click(destination_chat, reply_to=reply_to)
+    helper_publications[token] = {
+        "destination_chat": destination_chat,
+        "reply_to": reply_to,
+        "sent_chat_id": sent.chat_id,
+        "sent_message_id": sent.id,
+        "source_link": source_link,
+        "bot_username": bot_username,
+    }
     if source_link:
         link = {**source_link, "helper_token": token}
         for callback_id, callback_link in source_link.get(
@@ -491,6 +510,37 @@ async def publish_through_helper(data, destination_chat, reply_to=None,
     return sent, token
 
 
+async def recover_helper_inline_message(token, replace_existing=False):
+    """Re-publish a Helper inline result if its previous message disappeared."""
+    publication = helper_publications.get(token)
+    if not publication:
+        raise RuntimeError("Не найдены данные для восстановления inline-сообщения")
+    if replace_existing:
+        old_chat = publication.get("sent_chat_id")
+        old_message = publication.get("sent_message_id")
+        if old_chat is not None and old_message is not None:
+            try:
+                await client.delete_messages(old_chat, old_message)
+            except Exception as exc:
+                logger.warning("Не удалось заменить старое inline-сообщение: %s", type(exc).__name__)
+    bot_username = publication["bot_username"]
+    results = await client.inline_query(bot_username, token)
+    if not results:
+        raise RuntimeError("Helper не вернул Inline Result при восстановлении")
+    sent = await results[0].click(
+        publication["destination_chat"],
+        reply_to=publication.get("reply_to"),
+    )
+    publication["sent_chat_id"] = sent.chat_id
+    publication["sent_message_id"] = sent.id
+    source_link = publication.get("source_link")
+    if source_link:
+        inline_reply_links[(sent.chat_id, sent.id)] = {
+            **source_link, "helper_token": token
+        }
+    return sent
+
+
 async def update_helper_inline_message(response, link, inline_message_id):
     data, callback_links = _message_to_helper_data(
         response, link["destination_chat"]
@@ -500,6 +550,10 @@ async def update_helper_inline_message(response, link, inline_message_id):
         raise RuntimeError("У callback отсутствует helper_token")
     if not inline_message_id:
         raise RuntimeError("Telegram не передал inline_message_id")
+    publication = helper_publications.get(token, {})
+    bot_username = publication.get("bot_username")
+    if bot_username:
+        await _upload_inline_image(token, bot_username, response)
 
     await helper_request("/helper/update", {
         "token": token,
@@ -578,6 +632,15 @@ async def handle_helper_event(kind, payload):
             helper_inline_ids[token] = inline_message_id
         return
 
+    if kind == "inline-recover":
+        token = payload.get("token")
+        if not token:
+            raise ValueError("missing inline token")
+        await recover_helper_inline_message(
+            token, replace_existing=bool(payload.get("replace_existing"))
+        )
+        return
+
     if kind == "callback":
         callback_id = payload.get("callback_id")
         inline_message_id = payload.get("inline_message_id")
@@ -612,20 +675,23 @@ async def helper_inline_chosen(request):
         return web.json_response({"ok": False, "error": "bad_request"}, status=400)
 
 
-async def ask_mineevo(text, timeout=30.0, internal=False, chat_id=None):
-    """Отправляет запрос MineEVO и ловит ближайшее входящее сообщение.
+async def ask_mineevo(text, timeout=30.0, internal=False, chat_id=None,
+                      on_waiting=None):
+    """Send a MineEVO request and wait for its actual result.
 
-    MineEVO не всегда оформляет ответ как reply и в группах сообщение
-    может приходить без признака sender.bot. Поэтому сначала проверяем
-    reply на наш запрос, а если его нет — берём самое раннее входящее
-    сообщение, появившееся после отправки запроса в этом же чате.
-    Общая блокировка не даёт параллельным командам перепутать ответы.
+    If MineEVO first replies with "Ожидайте...", an optional callback can
+    publish that interim message while this function keeps polling for the
+    final response or an edit of the same message.
     """
     if not text:
         return None
     target_chat = config["mine_work_chat"] if chat_id is None else chat_id
     if target_chat is None:
         raise RuntimeError(".work не настроен")
+
+    def is_waiting(message):
+        value = (getattr(message, "raw_text", None) or "").strip().lower()
+        return value.startswith("ожидайте")
 
     async with ask_mineevo_lock:
         sent = await client.send_message(target_chat, text)
@@ -635,6 +701,11 @@ async def ask_mineevo(text, timeout=30.0, internal=False, chat_id=None):
         )
         deadline = asyncio.get_running_loop().time() + timeout
         first_incoming = None
+        first_seen_at = None
+        waiting_message_id = None
+        waiting_text = None
+        waiting_callback_done = False
+
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.2)
             try:
@@ -646,6 +717,24 @@ async def ask_mineevo(text, timeout=30.0, internal=False, chat_id=None):
                 )
                 continue
 
+            by_id = {msg.id: msg for msg in messages}
+            if waiting_message_id is not None:
+                current_waiting = by_id.get(waiting_message_id)
+                if current_waiting:
+                    current_text = current_waiting.raw_text or ""
+                    if current_text.strip() != (waiting_text or "").strip() and not is_waiting(current_waiting):
+                        logger.info("[MINE] промежуточное сообщение обновлено до результата")
+                        return current_waiting
+
+                later = sorted(
+                    (msg for msg in messages
+                     if msg.id > waiting_message_id and not msg.out
+                     and not is_waiting(msg)),
+                    key=lambda msg: msg.id,
+                )
+                if later:
+                    return later[0]
+
             incoming = sorted(
                 (msg for msg in messages if msg.id > sent.id and not msg.out),
                 key=lambda msg: msg.id,
@@ -653,29 +742,40 @@ async def ask_mineevo(text, timeout=30.0, internal=False, chat_id=None):
             if not incoming:
                 continue
 
-            # Reply на конкретный запрос всегда приоритетнее обычного сообщения.
+            reply_candidates = []
             for msg in incoming:
                 reply = getattr(msg, "reply_to", None)
                 if getattr(reply, "reply_to_msg_id", None) == sent.id:
-                    logger.info(
-                        "[MINE] найден reply на запрос (message_id=%s)", msg.id
-                    )
-                    return msg
+                    reply_candidates.append(msg)
+            candidates = reply_candidates or incoming
+            candidate = candidates[0]
 
-            # Если reply отсутствует, MineEVO обычно присылает отдельное
-            # сообщение сразу после команды. Не фильтруем sender.bot:
-            # в группах Telegram иногда возвращает отправителя без этого флага.
+            if is_waiting(candidate):
+                if waiting_message_id is None:
+                    waiting_message_id = candidate.id
+                    waiting_text = candidate.raw_text or ""
+                if on_waiting and not waiting_callback_done:
+                    await on_waiting(candidate)
+                    waiting_callback_done = True
+                continue
+
+            if waiting_message_id is not None:
+                return candidate
+
+            if reply_candidates:
+                logger.info(
+                    "[MINE] найден reply на запрос (message_id=%s)", candidate.id
+                )
+                return candidate
+
             if first_incoming is None:
-                first_incoming = incoming[0]
+                first_incoming = candidate
                 first_seen_at = asyncio.get_running_loop().time()
                 logger.info(
                     "[MINE] найдено обычное входящее сообщение после запроса "
                     "(message_id=%s); проверяю возможный reply",
                     first_incoming.id
                 )
-
-            # Даём короткий интервал, чтобы не пропустить reply, который
-            # появился почти одновременно с обычным сообщением.
             if asyncio.get_running_loop().time() - first_seen_at >= 0.6:
                 logger.info(
                     "[MINE] используем ближайшее входящее сообщение "
@@ -1489,7 +1589,7 @@ def _calc_format(value, digits=12):
         return str(value)
 
 
-def _numeric_roots(expr, variable, lower=-100, upper=100, step=0.25):
+def _numeric_roots(expr, variable, lower=-1000, upper=1000, step=0.25):
     """Find real roots numerically for equations without a closed form."""
     roots = []
     try:
@@ -1591,11 +1691,11 @@ def solve_equation(equation, show_steps=False):
             else:
                 numeric = _numeric_roots(difference, variable)
                 solutions = [sp.Float(r, 12) for r in numeric]
-                steps.append("2. Закрытая формула не найдена; ищем действительные корни численно на отрезке [-100; 100].")
+                steps.append("2. Закрытая формула не найдена; ищем действительные корни численно на отрезке [-1000; 1000].")
     except Exception:
         numeric = _numeric_roots(difference, variable)
         solutions = [sp.Float(r, 12) for r in numeric]
-        steps.append("2. Используем численный поиск действительных корней на отрезке [-100; 100].")
+        steps.append("2. Используем численный поиск действительных корней на отрезке [-1000; 1000].")
 
     # Filter invalid/complex roots and verify candidates in original equation.
     cleaned = []
@@ -2670,13 +2770,21 @@ async def register_handlers():
     async def promosource_handler(event):
         """Sets the current chat as the source for promo announcements."""
         config["promo_source_chat"] = event.chat_id
+        config["thx_source_chat"] = event.chat_id
+        config["thx_enabled"] = True
         save_config()
         await answer_and_delete(
             event,
-            "✅ <b>Источник промокодов подключён.</b>\n"
+            "✅ <b>Общий источник подключён.</b>\n"
             f"ID чата: <code>{event.chat_id}</code>\n"
-            "Ищу сообщения вида <code>Пиши в боте: Промо КОД</code>.",
+            "Отслеживаю промокоды и события Thx.",
         )
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.thxoff$"))
+    async def thxoff_handler(event):
+        config["thx_enabled"] = False
+        save_config()
+        await answer_and_delete(event, "✅ Наблюдение за событиями Thx выключено.")
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.botimers$"))
     async def botimers_handler(event):
@@ -3186,36 +3294,71 @@ async def register_handlers():
                 "⚠️ Сначала подключите рабочую группу MineEVO командой "
                 "<code>.work</code>."
             )
-        try:
-            # MineEVO can respond slower than the default short polling window.
-            response = await ask_mineevo(args, timeout=30.0, chat_id=config["mine_work_chat"])
-            if response is None:
-                return await answer_and_delete(
-                    event, "⚠️ MineEVO не ответил."
-                )
-            reply_to = event.reply_to_msg_id if event.is_reply else None
-            # Always publish through Helper Bot: its inline callback bridge is
-            # required for MineEVO buttons to work in the copied response.
-            # Premium emoji are best-effort; functional buttons take priority.
-            data, callback_links = _message_to_helper_data(
-                response, event.chat_id
-            )
+
+        published = {}
+        reply_to = event.reply_to_msg_id if event.is_reply else None
+
+        async def publish_waiting(response):
+            data, callback_links = _message_to_helper_data(response, event.chat_id)
             source_link = {
                 "source_chat": response.chat_id,
                 "source_message_id": response.id,
                 "destination_chat": event.chat_id,
                 "callback_links": callback_links,
             }
-            await publish_through_helper(
-                data, event.chat_id, reply_to=reply_to,
-                source_link=source_link
+            sent, token = await publish_through_helper(
+                data, event.chat_id, reply_to=reply_to, source_link=source_link,
+                media_message=response,
             )
+            published.update({
+                "token": token,
+                "link": {**source_link, "helper_token": token},
+                "sent": sent,
+            })
+
+        try:
+            response = await ask_mineevo(
+                args, timeout=30.0, chat_id=config["mine_work_chat"],
+                on_waiting=publish_waiting,
+            )
+            if response is None:
+                return await answer_and_delete(event, "⚠️ MineEVO не ответил.")
+
+            if published.get("token"):
+                token = published["token"]
+                inline_message_id = helper_inline_ids.get(token)
+                for _ in range(50):
+                    if inline_message_id:
+                        break
+                    await asyncio.sleep(0.1)
+                    inline_message_id = helper_inline_ids.get(token)
+                if not inline_message_id:
+                    raise RuntimeError("Helper не передал inline_message_id для обновления .evo")
+
+                data, callback_links = _message_to_helper_data(response, event.chat_id)
+                link = published["link"]
+                link.update({
+                    "source_chat": response.chat_id,
+                    "source_message_id": response.id,
+                    "callback_links": callback_links,
+                })
+                await update_helper_inline_message(response, link, inline_message_id)
+                helper_publications[token]["source_link"] = link
+            else:
+                data, callback_links = _message_to_helper_data(response, event.chat_id)
+                source_link = {
+                    "source_chat": response.chat_id,
+                    "source_message_id": response.id,
+                    "destination_chat": event.chat_id,
+                    "callback_links": callback_links,
+                }
+                await publish_through_helper(
+                    data, event.chat_id, reply_to=reply_to,
+                    source_link=source_link, media_message=response,
+                )
             await event.delete()
         except Exception as exc:
             logger.exception("Ошибка .evo")
-            # Показываем понятную причину: раньше ошибки ожидания ответа и
-            # ошибки Helper Bot отображались одинаково, поэтому их нельзя
-            # было отличить при настройке.
             safe_reason = str(exc).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             if len(safe_reason) > 350:
                 safe_reason = safe_reason[:347] + "..."
@@ -3514,7 +3657,7 @@ async def register_handlers():
         global thx_last_event_id
         if not config["thx_enabled"]:
             return
-        source_chat = config["thx_source_chat"]
+        source_chat = config.get("promo_source_chat")
         if source_chat is None or event.chat_id != source_chat:
             return
         text = event.raw_text or ""

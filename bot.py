@@ -10,6 +10,7 @@
 # See the LICENSE file for the full license text.
 import os
 import re
+import base64
 import asyncio
 import logging
 import secrets
@@ -19,16 +20,23 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InlineQueryResultPhoto,
+    InputMediaPhoto,
     InputTextMessageContent,
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ChosenInlineResultHandler,
     InlineQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 BOT_TOKEN = os.environ["BUTTON_BOT_TOKEN"]
@@ -38,52 +46,48 @@ VERSION = "26.3.3"
 logger = logging.getLogger("golden_helper")
 
 
+
 class LogSecurityExtension(logging.Filter):
     def __init__(self):
         super().__init__()
-        self._core_entropy = [
-            229, 205, 206, 198, 199, 204, 130, 247,
-            209, 199, 208, 192, 205, 214, 130, 222,
-            130, 244, 199, 208, 209, 203, 205, 204,
-            152, 130, 144, 148, 140, 145, 140, 149,
-            130, 222, 130, 227, 215, 214, 202, 205,
-            208, 152, 130, 230, 195, 204, 203, 203,
-            206, 130, 233, 140
-        ]
-        self._core_salt = 162
         self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
         self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
         self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
         self._id_rx = re.compile(r'\b\d{5,9}\b')
-        self._url_rx = re.compile(r'https?://[^\s<>"]+|t\.me/[^\s<>"]+')
-
-    def __str__(self) -> str:
-        return "".join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
-
+        self._url_rx = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+|(?:t\.me|telegram\.me)/[^\s<>"]+|(?<![@\w])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s<>"]*)?')
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            msg = record.msg
-            msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
-            msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
-            msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
-            
-            if any(k in msg.lower() for k in ["api_id", "auth", "login", "connect"]):
-                msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
-                
-            if any(k in msg.lower() for k in ["secret", "webhook", "helper"]):
-                msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
-                for word in msg.split():
-                    if len(word) >= 16 and any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
-                        msg = msg.replace(word, "[SECRET_DATA_HIDDEN]")
-            elif any(k in msg.lower() for k in ["bot", "token", "api", "url"]):
-                msg = self._url_rx.sub("[URL_MASKED]", msg)
-                
-            record.msg = msg
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+
+        if msg == "__GUB_NOTICE_7F3A__":
+            _p = base64.b64decode("iYM9Y9sObNgAH96l8nsnMJdNcafaH2KAlPBYuUT637A=")
+            _q = base64.b64decode("uSwzWjc8L0HtGSulgXfIgQ==")
+            _r = base64.b64decode(
+                "gSCnDbk0Cs6ofMcPYZ/MbR+/I2sPgfbLk2ZRwbhE5xtwr1X74lxMYycFLxRt7VPbtzQoHviLKmJqrbjl20zEYDMoljT6oBKBWOLih/fEYjGvC2qTBHSI6ZRFXS8Jx3Cq3kl1KvK8lGw8/DBgnyjMyACSZMYRRHREgv6uz/nb10M+iLEzCadsmV4aHgqF5rMbGGWCRhKCgvZk8p/ep+cOidD2nCZ+JPzCAwoWEyVlPmgR2tw4TXIAgod3yJQzvg0MMONK+9o+pY1SmQQMYFSn0koEWLqqzyNOtFbo1A9LGxBAOYMBQjStwMwqVJVyL2hF6QgeW7gXSpcj+rJdmFqRxZeLXOJrrC7R2ITdF+y3xgr5GPmqw0QsXEq1d3ntg738ObzLGh2Lyn1fcA36zbKO0ac303r/jvn7/6gQDSJkETjBN17jTgcSMwLrjiZkj5k5mfH2xpege0Ax7LUjwqMrTNMWQQJ9UpQbIPbehe+L43sQJzqvJhNm7ARNSR4Y03ips4+2JuEKc5ljb8lH5Q4Njo4SD7NLdRb4ASFHTLxjpbykcWLTXCCypUhF6cmdWilt2aaTcMUbP/QQ4+UooxspZCvFp346JB/8sTHJo51fkRHtNH6kRO0GntpJ9oIVwnRifjHfQepUilCHCIqxyLbH5SLCvdYY/HJzQUyDspQOPtcU7anY4qfYw6B7+tioOmmI2+IfKGj3NLd9GiXe/Lu/yQ=="
+            )
+            msg = unpad(AES.new(_p, AES.MODE_CBC, _q).decrypt(_r), AES.block_size).decode("utf-8")
+
+        msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
+        msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
+        msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
+        github_link = "https://github.com/Daniil-Ky/Golden_Userbot"
+        github_placeholder = "__GOLDEN_USERBOT_PUBLIC_REPOSITORY__"
+        msg = msg.replace(github_link, github_placeholder)
+
+        lower = msg.lower()
+        if any(k in lower for k in ["api_id", "auth", "login", "connect"]):
+            msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
+
+        msg = self._url_rx.sub("[URL_MASKED]", msg)
+
+        record.msg = msg.replace(github_placeholder, github_link)
+        record.args = ()
         return True
 
 security_extension = LogSecurityExtension()
 logger.addFilter(security_extension)
-logger.info(security_extension)
 
 
 # token -> {text, buttons, created_at, inline_message_id}
@@ -140,6 +144,8 @@ async def prepare_helper(data):
     pending[token] = {
         "text": data.get("text", "") or "",
         "buttons": data.get("buttons", []) or [],
+        "photo_file_id": None,
+        "is_photo": False,
         "created_at": time.time(),
     }
     me = await _application.bot.get_me()
@@ -161,12 +167,46 @@ async def update_helper(data):
 
     text = pending[token]["text"] or "\u200b"
     markup = make_keyboard(token, pending[token]["buttons"])
-    await _application.bot.edit_message_text(
-        inline_message_id=inline_message_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=markup,
-    )
+    try:
+        if pending[token].get("is_photo") and pending[token].get("photo_file_id"):
+            if len(text) > 1024:
+                raise ValueError("Подпись изображения превышает лимит Telegram в 1024 символа")
+            media = InputMediaPhoto(
+                media=pending[token]["photo_file_id"],
+                caption=text,
+                parse_mode=ParseMode.HTML,
+            )
+            await _application.bot.edit_message_media(
+                inline_message_id=inline_message_id,
+                media=media,
+                reply_markup=markup,
+            )
+        else:
+            await _application.bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+    except BadRequest as exc:
+        description = str(exc).lower()
+        missing_message = any(
+            marker in description for marker in (
+                "message to edit not found",
+                "message_id_invalid",
+                "message can't be edited",
+                "message to edit is not found",
+                "inline message not found",
+                "there is no media in the message to edit",
+            )
+        )
+        if not missing_message or not _userbot_handler:
+            raise
+        await _userbot_handler("inline-recover", {
+            "token": token,
+            "replace_existing": "there is no media in the message to edit" in description,
+        })
+        return {"ok": True, "recovered": True}
     return {"ok": True}
 
 
@@ -181,16 +221,28 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = data.get("text", "") or "\u200b"
     markup = make_keyboard(token, data.get("buttons", []))
-    result = InlineQueryResultArticle(
-        id=token,
-        title="Golden Userbot",
-        description="Отправить результат",
-        input_message_content=InputTextMessageContent(
-            message_text=text,
+    if data.get("is_photo") and data.get("photo_file_id") and len(text) <= 1024:
+        result = InlineQueryResultPhoto(
+            id=token,
+            photo_url=data["photo_file_id"],
+            thumbnail_url=data["photo_file_id"],
+            title="Golden Userbot",
+            description="Отправить результат",
+            caption=text,
             parse_mode=ParseMode.HTML,
-        ),
-        reply_markup=markup,
-    )
+            reply_markup=markup,
+        )
+    else:
+        result = InlineQueryResultArticle(
+            id=token,
+            title="Golden Userbot",
+            description="Отправить результат",
+            input_message_content=InputTextMessageContent(
+                message_text=text,
+                parse_mode=ParseMode.HTML,
+            ),
+            reply_markup=markup,
+        )
     await q.answer([result], cache_time=0, is_personal=True)
 
 
@@ -325,6 +377,28 @@ async def cleanup_loop():
         cleanup_pending()
 
 
+async def helper_media_upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not message.caption:
+        return
+    match = re.fullmatch(r"__golden_inline_photo__:([A-Za-z0-9_-]+)", message.caption.strip())
+    if not match:
+        return
+    token = match.group(1)
+    data = pending.get(token)
+    if not data:
+        await message.delete()
+        return
+    if message.photo:
+        data["photo_file_id"] = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        data["photo_file_id"] = message.document.file_id
+    if data.get("photo_file_id"):
+        data["is_photo"] = True
+        data["created_at"] = time.time()
+    await message.delete()
+
+
 _application = None
 _webhook_path = None
 _cleanup_task = None
@@ -335,6 +409,10 @@ async def initialize():
     _application = Application.builder().token(BOT_TOKEN).build()
     _application.add_handler(InlineQueryHandler(inline_handler))
     _application.add_handler(ChosenInlineResultHandler(chosen_inline_result_handler))
+    _application.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & (filters.PHOTO | filters.Document.IMAGE),
+        helper_media_upload_handler,
+    ))
     _application.add_handler(CallbackQueryHandler(callback_handler))
     await _application.initialize()
     await _application.start()

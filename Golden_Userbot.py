@@ -17,49 +17,37 @@ logger = logging.getLogger("golden_launcher")
 class LogSecurityExtension(logging.Filter):
     def __init__(self):
         super().__init__()
-        self._core_entropy = [
-            229, 205, 206, 198, 199, 204, 130, 247,
-            209, 199, 208, 192, 205, 214, 130, 222,
-            130, 244, 199, 208, 209, 203, 205, 204,
-            152, 130, 144, 148, 140, 145, 140, 149,
-            130, 222, 130, 227, 215, 214, 202, 205,
-            208, 152, 130, 230, 195, 204, 203, 203,
-            206, 130, 233, 140
-        ]
-        self._core_salt = 162
         self._token_rx = re.compile(r'\d{8,12}:[A-Za-z0-9_-]{35}')
         self._session_rx = re.compile(r'\b[14B][A-Za-z0-9_-]{100,}\b')
         self._hash_rx = re.compile(r'\b[a-fA-F0-9]{32}\b')
         self._id_rx = re.compile(r'\b\d{5,9}\b')
-        self._url_rx = re.compile(r'https?://[^\s<>"]+|t\.me/[^\s<>"]+')
-
-    def __str__(self) -> str:
-        return "".join(chr(byte ^ self._core_salt) for byte in self._core_entropy)
-
+        self._url_rx = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+|(?:t\.me|telegram\.me)/[^\s<>"]+|(?<![@\w])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/[^\s<>"]*)?')
     def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            msg = record.msg
-            msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
-            msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
-            msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
-            
-            if any(k in msg.lower() for k in ["api_id", "auth", "login", "connect"]):
-                msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
-                
-            if any(k in msg.lower() for k in ["secret", "webhook", "helper"]):
-                msg = self._url_rx.sub("[WEBHOOK_URL_HIDDEN]", msg)
-                for word in msg.split():
-                    if len(word) >= 16 and any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
-                        msg = msg.replace(word, "[SECRET_DATA_HIDDEN]")
-            elif any(k in msg.lower() for k in ["bot", "token", "api", "url"]):
-                msg = self._url_rx.sub("[URL_MASKED]", msg)
-                
-            record.msg = msg
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+
+        msg = self._token_rx.sub("[TELEGRAM_TOKEN_HIDDEN]", msg)
+        msg = self._session_rx.sub("[STRING_SESSION_HIDDEN]", msg)
+        msg = self._hash_rx.sub("[API_HASH_HIDDEN]", msg)
+        github_link = "https://github.com/Daniil-Ky/Golden_Userbot"
+        github_placeholder = "__GOLDEN_USERBOT_PUBLIC_REPOSITORY__"
+        msg = msg.replace(github_link, github_placeholder)
+
+        lower = msg.lower()
+        if any(k in lower for k in ["api_id", "auth", "login", "connect"]):
+            msg = self._id_rx.sub("[API_ID_HIDDEN]", msg)
+
+        msg = self._url_rx.sub("[URL_MASKED]", msg)
+
+        record.msg = msg.replace(github_placeholder, github_link)
+        record.args = ()
         return True
 
 security_extension = LogSecurityExtension()
 logger.addFilter(security_extension)
-logger.info(security_extension)
+bot.logger.info("__GUB_NOTICE_7F3A__")
 
 PORT = int(os.environ.get("PORT", "10000"))
 

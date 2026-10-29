@@ -13,3 +13,5 @@ python-telegram-bot==22.5
 aiohttp==3.10.10
 
 sympy==1.14.0
+
+pycryptodome==3.23.0
