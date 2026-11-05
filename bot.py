@@ -20,7 +20,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
-    InlineQueryResultPhoto,
+    InlineQueryResultCachedPhoto,
+    ReplyKeyboardMarkup,
     InputMediaPhoto,
     InputTextMessageContent,
     Update,
@@ -35,6 +36,7 @@ from telegram.ext import (
     ChosenInlineResultHandler,
     InlineQueryHandler,
     MessageHandler,
+    CommandHandler,
     ContextTypes,
     filters,
 )
@@ -124,7 +126,12 @@ def make_keyboard(token, buttons):
             typ = b.get("type")
             label = str(b.get("text", ""))
             if typ == "url" and b.get("url"):
-                out_row.append(InlineKeyboardButton(label, url=b["url"]))
+                style = b.get("style")
+                allowed_styles = {"primary", "success", "danger"}
+                kwargs = {"url": b["url"]}
+                if style in allowed_styles:
+                    kwargs["style"] = style
+                out_row.append(InlineKeyboardButton(label, **kwargs))
             elif typ == "callback" and b.get("id"):
                 callback_data = f"evo:{token}:{b['id']}"
                 if len(callback_data.encode("utf-8")) > 64:
@@ -222,10 +229,9 @@ async def inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = data.get("text", "") or "\u200b"
     markup = make_keyboard(token, data.get("buttons", []))
     if data.get("is_photo") and data.get("photo_file_id") and len(text) <= 1024:
-        result = InlineQueryResultPhoto(
+        result = InlineQueryResultCachedPhoto(
             id=token,
-            photo_url=data["photo_file_id"],
-            thumbnail_url=data["photo_file_id"],
+            photo_file_id=data["photo_file_id"],
             title="Golden Userbot",
             description="Отправить результат",
             caption=text,
@@ -399,6 +405,116 @@ async def helper_media_upload_handler(update: Update, context: ContextTypes.DEFA
     await message.delete()
 
 
+
+# HelperBot information menu. The top-level menu intentionally has four
+# one-column buttons; detailed topics are opened from nested menus.
+MINEEVO_REFERRAL_URL = os.environ.get("MINEEVO_REFERRAL_URL", "").strip()
+HELPER_MENU = ReplyKeyboardMarkup(
+    [["🎮 Что такое MineEVO?"], ["🤖 Что такое Golden Userbot?"],
+     ["⚙️ Как подключить Golden Userbot?"], ["📚 Подробная документация"]],
+    resize_keyboard=True,
+)
+INFO_TEXTS = {
+    "mineevo": (
+        "🎮 <b>Что такое MineEVO?</b>\n\n"
+        "MineEVO — Telegram-игра с развитием персонажа, ресурсами, заданиями и боссами.\n\n"
+        "При первом запуске игры по реферальной ссылке приглашаемый пользователь "
+        "получит приз после достижения 30-го уровня. Пригласивший также получает бонус. "
+        "Какой именно приз — не раскрываем.\n\n"
+        "⚠️ Если впервые запустить MineEVO без реферальной ссылки, бонус не будет "
+        "начислен. Привязать аккаунт по реферальной ссылке позже уже нельзя."
+    ),
+    "golden": (
+        "🤖 <b>Что такое Golden Userbot?</b>\n\n"
+        "Golden Userbot — пользовательский Telegram-клиент для автоматизации "
+        "повторяющихся действий и работы с MineEVO. HelperBot публикует inline-"
+        "сообщения и обслуживает кнопки.\n\n"
+        "Юзербот авторизуется как Telegram-аккаунт владельца. Поэтому другой человек "
+        "не может просто воспользоваться уже подключённым экземпляром: ему нужна "
+        "собственная установка и собственная сессия. Никому не передавайте StringSession, "
+        "API Hash или токены."
+    ),
+    "setup": (
+        "⚙️ <b>Как подключить Golden Userbot?</b>\n\n"
+        "1. Создайте собственного Telegram-бота через BotFather.\n"
+        "2. Подготовьте Telegram API ID и API Hash и StringSession своего аккаунта.\n"
+        "3. Разверните проект на поддерживаемом хостинге и задайте переменные окружения "
+        "из документации: BUTTON_BOT_TOKEN, HELPER_SECRET, API_ID, API_HASH и STRING_SESSION.\n"
+        "4. Укажите WEBHOOK_URL (или используйте RENDER_EXTERNAL_URL) и запустите сервис.\n\n"
+        "Не публикуйте секреты и не используйте чужую StringSession."
+    ),
+    "docs": (
+        "📚 <b>Подробная документация</b>\n\n"
+        "Полное описание установки, настроек, переменных окружения и команд находится "
+        "в README репозитория Golden Userbot."
+    ),
+    "invite": (
+        "👥 <b>Как пригласить в MineEVO</b>\n\n"
+        "Передайте человеку свою реферальную ссылку и попросите впервые открыть игру "
+        "именно по ней. После первого запуска привязать аккаунт задним числом нельзя."
+    ),
+    "clan": (
+        "🏆 <b>Клан Golden Newbies</b>\n\n"
+        "Golden Newbies - твой новый дом! Ты уже не нуб, но ещё не топ? Ты выкачал "
+        "перса, но играешь в соло? Пора это менять! Это клан для прокачанных новичков.\n\n"
+        "Техническое имя клана: <code>Golden_Newbies</code>."
+    ),
+}
+
+INFO_KEYBOARDS = {
+    "mineevo": [[InlineKeyboardButton("Как пригласить в MineEVO", callback_data="info:invite")]],
+    "golden": [[InlineKeyboardButton("Почему другой человек не может пользоваться моим юзерботом?", callback_data="info:privacy")]],
+    "setup": [[InlineKeyboardButton("Приглашение в клан Golden Newbies", callback_data="info:clan")]],
+}
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            "Привет! Я HelperBot проекта Golden Userbot. Выберите раздел:",
+            reply_markup=HELPER_MENU,
+        )
+
+async def helper_info_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+    mapping = {
+        "🎮 Что такое MineEVO?": "mineevo",
+        "🤖 Что такое Golden Userbot?": "golden",
+        "⚙️ Как подключить Golden Userbot?": "setup",
+        "📚 Подробная документация": "docs",
+    }
+    key = mapping.get(message.text.strip())
+    if not key:
+        return
+    text = INFO_TEXTS[key]
+    if key == "mineevo" and MINEEVO_REFERRAL_URL:
+        text += "\n\n🔗 <a href=\"" + MINEEVO_REFERRAL_URL.replace("&", "&amp;").replace("\"", "&quot;") + "\">Открыть MineEVO по реферальной ссылке</a>"
+    if key == "docs":
+        text += "\n\nhttps://github.com/Daniil-Ky/Golden_Userbot"
+    keyboard = INFO_KEYBOARDS.get(key)
+    await message.reply_text(
+        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+    )
+
+async def helper_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("info:"):
+        return
+    key = query.data.split(":", 1)[1]
+    await query.answer()
+    if key == "privacy":
+        text = ("🔐 <b>Почему другой человек не может пользоваться вашим юзерботом?</b>\n\n"
+                "Юзербот работает от имени Telegram-аккаунта, который авторизован в StringSession. "
+                "Другому человеку нужна собственная установка и собственная сессия. "
+                "Не передавайте сессию, API Hash и токены.")
+    else:
+        text = INFO_TEXTS.get(key)
+    if not text:
+        return
+    await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=HELPER_MENU)
+
 _application = None
 _webhook_path = None
 _cleanup_task = None
@@ -407,6 +523,9 @@ _cleanup_task = None
 async def initialize():
     global _application
     _application = Application.builder().token(BOT_TOKEN).build()
+    _application.add_handler(CommandHandler("start", start_command))
+    _application.add_handler(CallbackQueryHandler(helper_info_callback, pattern=r"^info:"))
+    _application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, helper_info_message))
     _application.add_handler(InlineQueryHandler(inline_handler))
     _application.add_handler(ChosenInlineResultHandler(chosen_inline_result_handler))
     _application.add_handler(MessageHandler(

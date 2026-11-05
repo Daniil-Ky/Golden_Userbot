@@ -16,6 +16,9 @@ import logging
 import secrets
 import ast
 import math
+import time
+from functools import lru_cache
+from decimal import Decimal, InvalidOperation
 import sympy as sp
 from sympy.parsing.sympy_parser import (
     parse_expr, standard_transformations, implicit_multiplication_application,
@@ -98,11 +101,14 @@ config = {
     "mine_work_chat": None,
     "thx_source_chat": -1001565066632,
     "promo_source_chat": -1001565066632,
+    "promo_source_enabled": True,
     "thx_enabled": False,
     "tc_template_chat": None,
     "tc_template_message": None,
     "lm_work_chat": None,
     "promo_seen": "EVO,437,EVO2,DEV2",
+    "notification_group": None,
+    "notification_mode": "chat",
 }
 
 
@@ -119,10 +125,10 @@ def load_config():
                     continue
                 if v == "None":
                     config[k] = None
-                elif k == "thx_enabled":
+                elif k in ("thx_enabled", "promo_source_enabled"):
                     config[k] = v.lower() == "true"
                 elif k in ("mine_work_chat", "thx_source_chat", "promo_source_chat",
-                           "tc_template_chat", "tc_template_message"):
+                           "tc_template_chat", "tc_template_message", "notification_group"):
                     config[k] = int(v) if v.lstrip("-").isdigit() else v
                 else:
                     config[k] = v
@@ -153,6 +159,7 @@ active_tasks = {}
 promo_task = None
 daily_task = None
 thx_last_event_id = None
+thx_reply_deadline = 0.0
 lm_task = None
 lm_state = None
 lm_queue = deque()
@@ -177,7 +184,7 @@ bo_timer_selection = None
 ask_mineevo_lock = asyncio.Lock()
 promo_lock = asyncio.Lock()
 # MineEVO rejects callback presses made too close together.  This limiter
-# is shared by .bo and .evo so every button press for MineEVO is separated
+# is shared by MineEVO automation and .evo so every button press is separated
 # by at least one second.
 MINE_BUTTON_INTERVAL = 1.0
 mine_button_lock = asyncio.Lock()
@@ -210,20 +217,51 @@ async def home(request):
 
 
 def parse_urlbtn(raw):
+    """Split a message from its trailing URL-button rows.
+
+    A line becomes a keyboard row only when every pipe-separated segment is
+    a valid `title - URL` definition. Earlier lines remain message text.
+    """
     lines = (raw or "").splitlines()
-    if not lines:
-        return None, []
-    message_text = lines[0].strip()
-    buttons = []
-    for line in lines[1:]:
-        line = line.strip()
-        if not line or " - " not in line:
-            continue
-        label, url = line.split(" - ", 1)
-        label, url = label.strip(), url.strip()
-        if label and re.match(r"^https?://\S+$", url):
-            buttons.append((label, url))
-    return message_text, buttons
+    button_rows = []
+
+    def parse_button_line(line):
+        parts = [part.strip() for part in line.split("|")]
+        if not parts or any(not part for part in parts):
+            return None
+        parsed = []
+        for part in parts:
+            match = re.fullmatch(
+                r"(.+?)\s+-\s+(https?://\S+?)(?:\s+-\s*style:(green|blue|red|success|primary|danger))?",
+                part,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                return None
+            label, url, style = match.groups()
+            style_map = {
+                "green": "success", "success": "success",
+                "blue": "primary", "primary": "primary",
+                "red": "danger", "danger": "danger",
+            }
+            parsed.append({
+                "type": "url",
+                "text": label.strip(),
+                "url": url.strip(),
+                "style": style_map.get((style or "").lower()),
+            })
+        return parsed
+
+    first_button_line = len(lines)
+    for index in range(len(lines) - 1, -1, -1):
+        parsed = parse_button_line(lines[index].strip())
+        if parsed is None:
+            break
+        button_rows.insert(0, parsed)
+        first_button_line = index
+
+    message_text = "\n".join(lines[:first_button_line]).strip()
+    return message_text, button_rows
 
 
 def build_url_buttons(buttons):
@@ -246,6 +284,23 @@ async def repeat_message_to_chat(chat_id, source_message, text_override=None,
     return await client.send_message(
         chat_id, text, formatting_entities=entities
     )
+
+
+async def send_repeat_status(source_chat_id, text, delay=STATUS_MESSAGE_LIFETIME):
+    """Send repeat progress to .notifigr's group, or back to its source chat."""
+    target_chat = config.get("notification_group") or source_chat_id
+    try:
+        message = await client.send_message(target_chat, text)
+    except Exception as exc:
+        if target_chat == source_chat_id:
+            raise
+        logger.warning(
+            "Не удалось отправить статус .repeat в группу уведомлений: %s; "
+            "отправляю в исходный чат.", type(exc).__name__
+        )
+        message = await client.send_message(source_chat_id, text)
+    autodelete(message, delay)
+    return message
 
 
 def _button_payload(button, callback_id=None):
@@ -937,13 +992,14 @@ async def promo_activate_from_source(code):
 
 
 async def daily_work_loop():
-    """Каждые 24 часа отправляет два отдельных сообщения в Work."""
+    """Каждые 24 часа отправляет бонусы в тот же чат, что и события Thx."""
     while True:
         try:
-            if config["mine_work_chat"] is not None:
-                await client.send_message(config["mine_work_chat"], "Ежедневный бонус")
-                await client.send_message(config["mine_work_chat"], "Сорвать бананы")
-                logger.info("[DAILY] Отправлены «Ежедневный бонус» и «Сорвать бананы»")
+            target_chat = config.get("thx_source_chat")
+            if target_chat is not None:
+                await client.send_message(target_chat, "Ежедневный бонус")
+                await client.send_message(target_chat, "Сорвать бананы")
+                logger.info("[DAILY] Отправлены «Ежедневный бонус» и «Сорвать бананы» в чат Thx")
             await asyncio.sleep(86400)
         except asyncio.CancelledError:
             raise
@@ -1008,8 +1064,11 @@ THX_TRIGGER = "активировал(а) бустер!"
 
 
 async def send_thx():
+    global thx_reply_deadline
     try:
-        await client.send_message(THX_BOT, "Thx")
+        message = await client.send_message(THX_BOT, "Thx")
+        autodelete(message, 10)
+        thx_reply_deadline = time.time() + 30
         logger.info("Отправлен Thx в личку с %s", THX_BOT)
     except Exception:
         logger.exception("Не удалось отправить Thx")
@@ -1582,7 +1641,16 @@ def _calc_format(value, digits=12):
         as_float = float(value)
         if not math.isfinite(as_float):
             return str(value)
-        if abs(as_float) < 1e-7 or abs(as_float) >= 1e10:
+        if abs(as_float) < 1e-7:
+            try:
+                decimal_value = Decimal(str(value))
+                rendered = format(decimal_value, "f")
+                if "." in rendered:
+                    rendered = rendered.rstrip("0").rstrip(".")
+                return rendered
+            except (InvalidOperation, ValueError):
+                return f"{as_float:.8g}"
+        if abs(as_float) >= 1e10:
             return f"{as_float:.8g}"
         return f"{as_float:.10g}"
     except Exception:
@@ -1642,6 +1710,7 @@ def _numeric_roots(expr, variable, lower=-1000, upper=1000, step=0.25):
     return unique
 
 
+@lru_cache(maxsize=256)
 def solve_equation(equation, show_steps=False):
     """Parse and solve a one-variable equation, returning a Russian result."""
     if equation.count("=") != 1:
@@ -1738,60 +1807,99 @@ def solve_equation(equation, show_steps=False):
     return result_text, steps
 
 
+@lru_cache(maxsize=256)
 def calculate_expression_steps(expr):
-    """Return a numeric operation-by-operation trace for a numeric expression."""
+    """Return a numeric operation-by-operation trace preserving input order."""
     normalized = _normalize_calc_input((expr or "").strip())
-    local_dict = dict(_CALC_LOCALS)
-    tree = parse_expr(
-        normalized, local_dict=local_dict, global_dict=_CALC_GLOBALS,
-        transformations=_CALC_TRANSFORMATIONS, evaluate=False,
-    )
-    if tree.free_symbols:
-        raise ValueError("Для пошагового вычисления неизвестных нужно уравнение с =")
     steps = []
+    binary_ops = {
+        ast.Add: (lambda a, b: a + b, "+"),
+        ast.Sub: (lambda a, b: a - b, "−"),
+        ast.Mult: (lambda a, b: a * b, "×"),
+        ast.Div: (lambda a, b: a / b, "÷"),
+        ast.Pow: (lambda a, b: a ** b, "^"),
+    }
 
-    def walk(node):
-        if not getattr(node, "args", ()):
-            return node
-        children = [walk(arg) for arg in node.args]
-        try:
-            rebuilt = node.func(*children, evaluate=False)
-        except TypeError:
-            rebuilt = node.func(*children)
-        if rebuilt.is_number:
-            value = sp.N(rebuilt, 12)
-            if rebuilt.func == sp.Add:
-                symbol = " + " if len(children) == 2 else " + "
-            elif rebuilt.func == sp.Mul:
-                symbol = " × "
-            elif rebuilt.func == sp.Pow:
-                symbol = " ^ "
-            else:
-                symbol = None
-            if symbol and len(children) == 2:
-                lhs_text = _calc_format(children[0], 10)
-                rhs_text = _calc_format(children[1], 10)
-                result_text = _calc_format(value, 12)
+    def evaluate_node(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return sp.Integer(node.value) if isinstance(node.value, int) else sp.Float(node.value)
+        if isinstance(node, ast.Name):
+            if node.id in ("pi", "π"):
+                return sp.pi
+            if node.id in ("e", "E"):
+                return sp.E
+            raise ValueError("Для пошагового вычисления переменные не поддерживаются")
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = evaluate_node(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and type(node.op) in binary_ops:
+            operation, symbol = binary_ops[type(node.op)]
+            left = evaluate_node(node.left)
+            right = evaluate_node(node.right)
+            value = operation(left, right)
+            if value.is_number:
+                steps.append(
+                    f"{_calc_format(left, 10)} {symbol} {_calc_format(right, 10)} = {_calc_format(value, 12)}"
+                )
+            return value
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            function = _CALC_FUNCTIONS.get(node.func.id)
+            if function is None or node.keywords:
+                raise ValueError("Неподдерживаемая функция")
+            args = [evaluate_node(arg) for arg in node.args]
+            return function(*args)
+        raise ValueError("Выражение требует символьного разбора")
+
+    try:
+        tree = ast.parse(normalized, mode="eval")
+        evaluated = evaluate_node(tree.body)
+        result = sp.N(evaluated, 16)
+        if result.is_real is False or not math.isfinite(float(result)):
+            raise ValueError("Результат не является конечным действительным числом")
+        return result, steps
+    except (SyntaxError, ValueError, TypeError, ZeroDivisionError, OverflowError):
+        # Preserve support for SymPy syntax such as implicit multiplication.
+        local_dict = dict(_CALC_LOCALS)
+        tree = parse_expr(
+            normalized, local_dict=local_dict, global_dict=_CALC_GLOBALS,
+            transformations=_CALC_TRANSFORMATIONS, evaluate=False,
+        )
+        if tree.free_symbols:
+            raise ValueError("Для пошагового вычисления неизвестных нужно уравнение с =")
+        fallback_steps = []
+
+        def walk(node):
+            if not getattr(node, "args", ()):
+                return node
+            children = [walk(arg) for arg in node.args]
+            try:
+                rebuilt = node.func(*children, evaluate=False)
+            except TypeError:
+                rebuilt = node.func(*children)
+            if rebuilt.is_number and len(children) == 2:
                 if rebuilt.func == sp.Add:
-                    steps.append(f"{lhs_text} + {rhs_text} = {result_text}")
+                    symbol = "+"
                 elif rebuilt.func == sp.Mul:
-                    steps.append(f"{lhs_text} × {rhs_text} = {result_text}")
+                    symbol = "×"
                 elif rebuilt.func == sp.Pow:
-                    steps.append(f"{lhs_text} ^ {rhs_text} = {result_text}")
-            elif rebuilt.func == sp.Add and len(children) > 2:
-                steps.append(f"{sp.sstr(rebuilt)} = {_calc_format(value, 12)}")
-            elif rebuilt.func not in (sp.Add, sp.Mul, sp.Pow):
-                steps.append(f"{sp.sstr(rebuilt)} = {_calc_format(value, 12)}")
-        return rebuilt
+                    symbol = "^"
+                else:
+                    symbol = None
+                if symbol:
+                    fallback_steps.append(
+                        f"{_calc_format(children[0], 10)} {symbol} "
+                        f"{_calc_format(children[1], 10)} = {_calc_format(sp.N(rebuilt, 12), 12)}"
+                    )
+            return rebuilt
 
-    evaluated = walk(tree)
-    result = sp.N(evaluated, 16)
-    if result.is_real is False or not math.isfinite(float(result)):
-        raise ValueError("Результат не является конечным действительным числом")
-    # Retain actual numeric steps in evaluation order and remove duplicates.
-    return result, list(dict.fromkeys(steps))
+        evaluated = walk(tree)
+        result = sp.N(evaluated, 16)
+        if result.is_real is False or not math.isfinite(float(result)):
+            raise ValueError("Результат не является конечным действительным числом")
+        return result, list(dict.fromkeys(fallback_steps))
 
 
+@lru_cache(maxsize=256)
 def calculate_expression(expr):
     """Evaluate a numeric expression or solve an equation if '=' is present."""
     expr = (expr or "").strip()
@@ -2135,7 +2243,7 @@ async def bo_get_fresh_message(chat_id, message_id):
 
 
 async def bo_wait_seconds(seconds):
-    # Ожидание прерывается .booff практически сразу.
+    # Ожидание прерывается событием остановки практически сразу.
     if seconds <= 0:
         return
     try:
@@ -2515,7 +2623,7 @@ async def bo_reward_and_return(victory):
         logger.warning("[BO] Подтверждение награды не найдено; продолжаю цикл.")
 
     # После получения награды MineEVO показывает единственную кнопку
-    # «Вернуться к боссу». Нажимаем её один раз и завершаем действие .bo.
+    # «Вернуться к боссу». Нажимаем её один раз и завершаем действие.
     return_button = None
     for source in (reward_message, victory):
         return_button = bo_find_button_contains(source, "вернуться к боссу")
@@ -2602,7 +2710,7 @@ async def bo_select_boss_retry(menu):
 
 
 async def bo_manual_selection_loop(work_chat):
-    """Продолжает .bo только после ручного выбора босса пользователем.
+    """Продолжает бой только после ручного выбора босса пользователем.
 
     Этот цикл не перебирает кнопки и не выбирает/не приоритизирует босса.
     Он лишь ждёт, пока пользователь сам нажмёт кнопку выбора в Work.
@@ -2701,12 +2809,75 @@ async def bo_loop(work_chat):
             logger.info("[BO] Цикл автоатаки остановлен.")
             raise
         except Exception as exc:
-            # Ошибка одного босса не должна убивать .bo навсегда.
+            # Ошибка одного босса не должна останавливать цикл навсегда.
             logger.exception("[BO] Ошибка цикла автоатаки: %s", exc)
             await bo_wait_seconds(3.0)
 
 
 async def register_handlers():
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.help$"))
+    async def help_handler(event):
+        text = (
+            "<b>📚 Golden Userbot — команды</b>\n\n"
+            "<b>MineEVO</b>\n"
+            "<code>.work</code> — подключить рабочий чат MineEVO\n"
+            "<code>.evo ТЕКСТ</code> — отправить команду MineEVO\n"
+            "<code>.botimers</code> — начать сбор доступных таймеров\n"
+            "<code>.botimersstop</code> — завершить сбор таймеров\n"
+            "<code>.notifigr</code> — назначить группу уведомлений\n"
+            "<code>.notifimode chat|group|both</code> — выбрать место уведомлений\n\n"
+            "<b>Промокоды и Thx</b>\n"
+            "<code>.promosource</code> — подключить источник промокодов и Thx\n"
+            "<code>.promostop</code> — отключить автоприём промокодов из источника\n"
+            "<code>.promoseen</code> — показать список обработанных кодов\n"
+            "<code>.promoseen +КОД</code> / <code>.promoseen -КОД</code> — изменить список\n"
+            "<code>.thxoff</code> — выключить наблюдение Thx\n\n"
+            "<b>Калькулятор</b>\n"
+            "<code>.calc ВЫРАЖЕНИЕ</code> — вычислить выражение\n"
+            "<code>.calc all ВЫРАЖЕНИЕ</code> — показать шаги\n\n"
+            "<b>Переводы лимитов</b>\n"
+            "<code>.lmgroup</code>, <code>.lm НИК КОЛИЧЕСТВО</code>, "
+            "<code>.lmpause</code>, <code>.lmresume</code>, <code>.lmstop</code>, "
+            "<code>.lchk</code>\n\n"
+            "<b>Прочее</b>\n"
+            "<code>.repeat</code> / <code>.stoprepeat</code>, <code>.urlbtn</code>, "
+            "<code>.tcset</code> / <code>.tc</code>\n\n"
+            "Команды работают в соответствии с настройками проекта и подключёнными чатами."
+        )
+        await answer_and_delete(event, text, delay=120)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.notifigr$"))
+    async def notifigr_handler(event):
+        if not event.is_group:
+            return await answer_and_delete(
+                event, "⚠️ Команду <code>.notifigr</code> нужно отправить внутри группы уведомлений."
+            )
+        config["notification_group"] = event.chat_id
+        save_config()
+        await answer_and_delete(
+            event, "🔔 Эта группа назначена чатом уведомлений.", delay=30
+        )
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.notifimode(?:\s+(chat|group|both))?$", flags=re.IGNORECASE))
+    async def notifimode_handler(event):
+        mode = (event.pattern_match.group(1) or "").lower()
+        if not mode:
+            current = config.get("notification_mode", "chat")
+            labels = {"chat": "текущий чат", "group": "группа уведомлений", "both": "оба места"}
+            return await answer_and_delete(
+                event, "🔔 <b>Режим уведомлений:</b> " + labels.get(current, current) +
+                "\nИспользование: <code>.notifimode chat</code>, "
+                "<code>.notifimode group</code> или <code>.notifimode both</code>."
+            )
+        if mode in ("group", "both") and not config.get("notification_group"):
+            return await answer_and_delete(
+                event, "⚠️ Сначала назначьте группу командой <code>.notifigr</code>."
+            )
+        config["notification_mode"] = mode
+        save_config()
+        labels = {"chat": "текущий чат", "group": "группа уведомлений", "both": "оба места"}
+        await answer_and_delete(event, f"✅ Уведомления настроены: <b>{labels[mode]}</b>.")
+
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.work$"))
     async def work_handler(event):
         config["mine_work_chat"] = event.chat_id
@@ -2751,8 +2922,9 @@ async def register_handlers():
             seen.add(code)
             config["promo_seen"] = ",".join(sorted(seen))
             save_config()
+            listing = "\n".join(f"• <code>{item}</code>" for item in sorted(seen)) or "<code>пусто</code>"
             return await answer_and_delete(
-                event, f"✅ Код <code>{code}</code> добавлен в <b>promo_seen</b>."
+                event, f"✅ Код <code>{code}</code> добавлен в <b>promo_seen</b>.\n\n<b>Текущий список:</b>\n{listing}"
             )
 
         if code not in seen:
@@ -2762,14 +2934,16 @@ async def register_handlers():
         seen.remove(code)
         config["promo_seen"] = ",".join(sorted(seen))
         save_config()
+        listing = "\n".join(f"• <code>{item}</code>" for item in sorted(seen)) or "<code>пусто</code>"
         await answer_and_delete(
-            event, f"✅ Код <code>{code}</code> удалён из <b>promo_seen</b>."
+            event, f"✅ Код <code>{code}</code> удалён из <b>promo_seen</b>.\n\n<b>Текущий список:</b>\n{listing}"
         )
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.promosource$"))
     async def promosource_handler(event):
         """Sets the current chat as the source for promo announcements."""
         config["promo_source_chat"] = event.chat_id
+        config["promo_source_enabled"] = True
         config["thx_source_chat"] = event.chat_id
         config["thx_enabled"] = True
         save_config()
@@ -2778,6 +2952,19 @@ async def register_handlers():
             "✅ <b>Общий источник подключён.</b>\n"
             f"ID чата: <code>{event.chat_id}</code>\n"
             "Отслеживаю промокоды и события Thx.",
+        )
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.promostop$"))
+    async def promostop_handler(event):
+        config["promo_source_enabled"] = False
+        save_config()
+        await answer_and_delete(
+            event,
+            "⏹ <b>Источник промокодов отключён.</b>\n"
+            "Новые коды из исходного чата больше не будут автоматически "
+            "активироваться. Периодическая проверка промокодов MineEVO "
+            "и наблюдение Thx не затронуты.\n"
+            "Повторное подключение: <code>.promosource</code>."
         )
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.thxoff$"))
@@ -2885,14 +3072,6 @@ async def register_handlers():
                       "пока Telegram не передаёт данные этого alert в события юзербота."])
         await answer_and_delete(event, "\n".join(lines), delay=60)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.bo(?:off)?$"))
-    async def removed_bo_handler(event):
-        await answer_and_delete(
-            event,
-            "⚠️ Команда <code>.bo</code> удалена. Используй <code>.botimers</code> "
-            "и <code>.botimersstop</code>."
-        )
-
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmgroup$"))
     async def lmgroup_handler(event):
         config["lm_work_chat"] = event.chat_id
@@ -2902,13 +3081,22 @@ async def register_handlers():
         )
         autodelete(msg)
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lm\s+(\S+)\s+(\d+)$"))
+    @client.on(events.NewMessage(
+        outgoing=True, pattern=r"^\.lm(?:\s+(\S+)\s+(\d+))?$"
+    ))
     async def lm_handler(event):
-        await start_lm(
-            event.pattern_match.group(1),
-            int(event.pattern_match.group(2)),
-            event
-        )
+        nick = event.pattern_match.group(1)
+        count = event.pattern_match.group(2)
+        if not nick or not count:
+            return await answer_and_delete(
+                event,
+                "<b>Перевод лимитов</b>\n"
+                "Формат: <code>.lm ник количество</code>\n"
+                "Пример: <code>.lm PlayerName 10</code>\n"
+                "Количество — целое число больше нуля.\n"
+                "Статус: <code>.lmq</code>; остановка: <code>.lmstop [ник]</code>."
+            )
+        await start_lm(nick, int(count), event)
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.lmpause(?:\s+(\S+))?$"))
     async def lmpause_handler(event):
@@ -3155,28 +3343,50 @@ async def register_handlers():
         outgoing=True, pattern=r"^\.urlbtn(?:\s+([\s\S]+))?$"
     ))
     async def urlbtn_handler(event):
-        raw = (event.pattern_match.group(1) or "").strip()
-        text, buttons = parse_urlbtn(raw)
-        if not text or not buttons:
+        raw = event.pattern_match.group(1) or ""
+        text, button_rows = parse_urlbtn(raw)
+        if not text or not button_rows:
             return await answer_and_delete(
                 event,
+                "<b>Создание сообщения с URL-кнопками</b>\n\n"
                 "<b>Формат:</b>\n"
                 "<code>.urlbtn Текст сообщения\n"
-                "Текст кнопки - https://example.com</code>"
+                "Текст кнопки - https://example.com</code>\n\n"
+                "Обычный текст может занимать несколько строк. Кнопками становятся "
+                "только завершающие строки, записанные в формате "
+                "<code>Название - URL</code>.\n\n"
+                "<b>Несколько кнопок в одной строке:</b>\n"
+                "<code>Кнопка 1 - https://example.com | Кнопка 2 - https://example.org</code>\n\n"
+                "<b>Цвет кнопки:</b> добавь в конец определения "
+                "<code>- style:green</code>, <code>- style:blue</code> или "
+                "<code>- style:red</code>. Также доступны названия стилей "
+                "<code>success</code>, <code>primary</code>, <code>danger</code>.\n\n"
+                "<b>Пример:</b>\n"
+                "<code>.urlbtn Привет!\nЭто обычный текст в двух строках.\n"
+                "Открыть сайт - https://example.com - style:green | Канал - https://t.me/example - style:blue\n"
+                "Подробнее - https://example.org - style:red</code>\n\n"
+                "Можно отправить фотографию, написав .urlbtn, текст и кнопки "
+                "прямо в её подписи. Фотография, текст и кнопки будут опубликованы "
+                "вместе одним сообщением. Также поддерживается ответ командой "
+                "на уже отправленную фотографию."
             )
-        data = {
-            "text": text,
-            "buttons": [
-                [{"type": "url", "text": label, "url": url}]
-                for label, url in buttons
-            ],
-        }
+
+        data = {"text": text, "buttons": button_rows}
         reply_to = event.reply_to_msg_id if event.is_reply else None
-        # Helper-related command: this is intentionally the exception to the
-        # "edit the command itself" rule because the result is an inline message.
+
+        # Preferred workflow: .urlbtn is written directly in the photo caption.
+        # In that case the command message itself is the media source.
+        # Keep the reply-to-photo workflow as a backwards-compatible fallback.
+        media_message = event.message if _has_inline_image(event.message) else None
+        if media_message is None and event.is_reply:
+            replied_message = await event.get_reply_message()
+            if replied_message and _has_inline_image(replied_message):
+                media_message = replied_message
+
         try:
             await publish_through_helper(
-                data, event.chat_id, reply_to=reply_to
+                data, event.chat_id, reply_to=reply_to,
+                media_message=media_message,
             )
             await event.delete()
         except Exception:
@@ -3197,6 +3407,8 @@ async def register_handlers():
         elif len(tokens) == 2 and event.is_reply:
             count_str, interval_str = tokens
             source = await event.get_reply_message()
+            if not source:
+                return await answer_and_delete(event, "⚠️ Не удалось получить исходное сообщение.")
             text = source.raw_text
             entities = source.entities
         else:
@@ -3209,39 +3421,50 @@ async def register_handlers():
 
         if not count_str.isdigit() or int(count_str) <= 0:
             return await answer_and_delete(
-                event,
-                "⚠️ <b>Количество</b> должно быть целым числом больше 0."
+                event, "⚠️ <b>Количество</b> должно быть целым числом больше 0."
             )
         try:
             interval_minutes = float(interval_str.replace(",", "."))
-            if interval_minutes < 0:
+            if not math.isfinite(interval_minutes) or interval_minutes < 0:
                 raise ValueError
         except ValueError:
             return await answer_and_delete(
                 event,
-                "⚠️ <b>Интервал</b> должен быть числом, например "
-                "<code>1.5</code>."
+                "⚠️ <b>Интервал</b> должен быть числом не меньше нуля, например <code>1.5</code>."
             )
 
         count = int(count_str)
+        interval_seconds = interval_minutes * 60
         chat_id = event.chat_id
-        active_tasks[chat_id] = {"stop": False}
-        status = await event.edit(
-            f"🚀 <b>Запущено:</b> {count} повторов, "
-            f"интервал {interval_minutes} мин.\n"
-            f"Остановить: <code>.stoprepeat</code>"
+        previous = active_tasks.get(chat_id)
+        if previous:
+            previous["stop_event"].set()
+
+        stop_event = asyncio.Event()
+        active_tasks[chat_id] = {"stop_event": stop_event}
+        interval_label = format_duration_seconds(round(interval_seconds))
+        await event.delete()
+        await send_repeat_status(
+            chat_id,
+            f"🚀 <b>Повтор запущен.</b>\n"
+            f"Количество: <code>{count}</code>\n"
+            f"Интервал: <code>{interval_label}</code>\n"
+            "Первое сообщение будет отправлено после ожидания интервала.\n"
+            "Остановить: <code>.stoprepeat</code>",
         )
-        autodelete(status)
+
         sent = 0
         try:
             for _ in range(count):
-                if active_tasks.get(chat_id, {}).get("stop"):
-                    msg = await client.send_message(
-                        chat_id,
-                        f"⛔ <b>Остановлено вручную</b> ({sent}/{count})."
-                    )
-                    autodelete(msg)
+                # The interval is also applied before the first send, including a single repeat.
+                if interval_seconds > 0:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    except asyncio.TimeoutError:
+                        pass
+                if stop_event.is_set():
                     break
+
                 if source is not None:
                     if source.media is not None:
                         await client.send_file(
@@ -3257,27 +3480,40 @@ async def register_handlers():
                 else:
                     await client.send_message(chat_id, text)
                 sent += 1
-                if sent < count:
-                    await asyncio.sleep(interval_minutes * 60)
-            if sent == count:
-                msg = await client.send_message(
-                    chat_id, f"✅ <b>Готово:</b> отправлено {sent}/{count}."
+
+            if stop_event.is_set():
+                await send_repeat_status(
+                    chat_id,
+                    f"⛔ <b>Повтор остановлен.</b> Отправлено <code>{sent}/{count}</code>.",
                 )
-                autodelete(msg)
+            else:
+                await send_repeat_status(
+                    chat_id,
+                    f"✅ <b>Повтор завершён.</b> Отправлено <code>{sent}/{count}</code>.",
+                )
+        except Exception:
+            logger.exception("Ошибка .repeat в чате %s", chat_id)
+            try:
+                await send_repeat_status(
+                    chat_id,
+                    f"⚠️ <b>Повтор прерван из-за ошибки.</b> Отправлено <code>{sent}/{count}</code>.",
+                )
+            except Exception:
+                logger.exception("Не удалось отправить статус ошибки .repeat")
         finally:
-            active_tasks.pop(chat_id, None)
+            if active_tasks.get(chat_id, {}).get("stop_event") is stop_event:
+                active_tasks.pop(chat_id, None)
 
     @client.on(events.NewMessage(outgoing=True, pattern=r"^\.stoprepeat$"))
     async def stop_handler(event):
         chat_id = event.chat_id
-        if chat_id in active_tasks:
-            active_tasks[chat_id]["stop"] = True
-            msg = await event.edit(
-                "⏳ <b>Останавливаю</b> после текущей отправки..."
-            )
+        task = active_tasks.get(chat_id)
+        await event.delete()
+        if task:
+            task["stop_event"].set()
+            await send_repeat_status(chat_id, "⏳ <b>Останавливаю повтор…</b>")
         else:
-            msg = await event.edit("Нет активных повторов в этом чате.")
-        autodelete(msg)
+            await send_repeat_status(chat_id, "ℹ️ Активного повтора в этом чате нет.")
 
     @client.on(events.NewMessage(
         outgoing=True, pattern=r"^\.evo(?: (.*))?$"
@@ -3286,7 +3522,12 @@ async def register_handlers():
         args = (event.pattern_match.group(1) or "").strip()
         if not args:
             return await answer_and_delete(
-                event, "⚠️ <b>Вы не указали команду для выполнения.</b>"
+                event,
+                "<b>Выполнение команды MineEVO</b>\n"
+                "Формат: <code>.evo текст_команды</code>\n"
+                "Примеры: <code>.evo профиль</code>, <code>.evo промо</code>, "
+                "<code>.evo ежедневный бонус</code>.\n"
+                "Команда отправляется в подключённую рабочую группу MineEVO."
             )
         if config["mine_work_chat"] is None:
             return await answer_and_delete(
@@ -3479,6 +3720,7 @@ async def register_handlers():
             return await answer_and_delete(
                 event, "⚠️ Формат: <code>.calc 2+2*5</code> или <code>.calc all уравнение</code>"
             )
+        started_at = time.perf_counter()
         try:
             if "=" in expr:
                 result_text, steps = solve_equation(expr, show_steps=all_mode)
@@ -3505,6 +3747,8 @@ async def register_handlers():
                         output += "\n\n<b>Пошаговые вычисления:</b>\n" + "\n".join(
                             f"{i}. <code>{step}</code>" for i, step in enumerate(steps, 1)
                         )
+            elapsed = time.perf_counter() - started_at
+            output += f"\n\n<small>⏱ Время обработки: {elapsed:.3f} с</small>"
             await event.edit(output[:3900], parse_mode="html")
         except Exception as exc:
             logger.info(".calc failed (%s)", type(exc).__name__)
@@ -3637,7 +3881,8 @@ async def register_handlers():
     @client.on(events.NewMessage(incoming=True))
     async def promo_source_watcher(event):
         source_chat = config.get("promo_source_chat")
-        if source_chat is None or event.chat_id != source_chat:
+        if (not config.get("promo_source_enabled", True) or
+                source_chat is None or event.chat_id != source_chat):
             return
 
         text = event.raw_text or ""
@@ -3667,6 +3912,17 @@ async def register_handlers():
             return
         thx_last_event_id = (event.chat_id, event.id)
         await send_thx()
+
+    @client.on(events.NewMessage(incoming=True, chats=THX_BOT))
+    async def thx_bot_reply_watcher(event):
+        # Only remove a reply shortly after this account has sent a Thx request.
+        if time.time() <= thx_reply_deadline and event.message:
+            autodelete(event.message, 10)
+
+    @client.on(events.MessageEdited(incoming=True, chats=THX_BOT))
+    async def thx_bot_edited_reply_watcher(event):
+        if time.time() <= thx_reply_deadline and event.message:
+            autodelete(event.message, 10)
 
 
 async def initialize():
