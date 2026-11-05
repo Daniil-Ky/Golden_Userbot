@@ -2858,7 +2858,13 @@ async def register_handlers():
             event, "🔔 Эта группа назначена чатом уведомлений.", delay=30
         )
 
-    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.notifimode(?:\s+(chat|group|both))?$", flags=re.IGNORECASE))
+    @client.on(events.NewMessage(
+    outgoing=True,
+    pattern=re.compile(
+        r"^\.notifimode(?:\s+(chat|group|both))?$",
+        re.IGNORECASE
+    )
+))
     async def notifimode_handler(event):
         mode = (event.pattern_match.group(1) or "").lower()
         if not mode:
