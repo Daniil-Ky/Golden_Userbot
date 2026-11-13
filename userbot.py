@@ -17,6 +17,7 @@ import secrets
 import ast
 import math
 import time
+import random
 from functools import lru_cache
 from decimal import Decimal, InvalidOperation
 import sympy as sp
@@ -200,8 +201,13 @@ async def schedule_delete(chat_id, message_id, delay=STATUS_MESSAGE_LIFETIME):
 
 
 def autodelete(msg, delay=STATUS_MESSAGE_LIFETIME):
-    if msg is not None:
-        asyncio.create_task(schedule_delete(msg.chat_id, msg.id, delay))
+    if msg is None:
+        return
+    # The configured notification group is a persistent log; never schedule
+    # automatic deletion for messages published there.
+    if config.get("notification_group") is not None and msg.chat_id == config.get("notification_group"):
+        return
+    asyncio.create_task(schedule_delete(msg.chat_id, msg.id, delay))
 
 
 async def answer_and_delete(event, text, delay=STATUS_MESSAGE_LIFETIME):
@@ -287,8 +293,11 @@ async def repeat_message_to_chat(chat_id, source_message, text_override=None,
 
 
 async def send_repeat_status(source_chat_id, text, delay=STATUS_MESSAGE_LIFETIME):
-    """Send repeat progress to .notifigr's group, or back to its source chat."""
+    """Send repeat status; messages in the persistent notification group are kept."""
     target_chat = config.get("notification_group") or source_chat_id
+    sent_to_notification_group = bool(
+        config.get("notification_group") and target_chat == config.get("notification_group")
+    )
     try:
         message = await client.send_message(target_chat, text)
     except Exception as exc:
@@ -299,7 +308,10 @@ async def send_repeat_status(source_chat_id, text, delay=STATUS_MESSAGE_LIFETIME
             "отправляю в исходный чат.", type(exc).__name__
         )
         message = await client.send_message(source_chat_id, text)
-    autodelete(message, delay)
+        sent_to_notification_group = False
+    # The notification group is an archive/status destination: never auto-delete there.
+    if not sent_to_notification_group:
+        autodelete(message, delay)
     return message
 
 
@@ -971,12 +983,12 @@ async def promo_activate_code(code, attempts=1):
 
 async def promo_activate_from_source(code):
     """Активирует код из исходного чата, если его ещё нет в promo_seen."""
-    code = (code or "").strip()
+    code = (code or "").strip().upper()
     if not code or config["mine_work_chat"] is None:
         return
 
     seen = {
-        x.strip() for x in config.get("promo_seen", "").split(",") if x.strip()
+        x.strip().upper() for x in config.get("promo_seen", "EVO,437,EVO2,DEV2").split(",") if x.strip()
     }
     if code in seen:
         logger.info("[PROMO] код %r уже есть в promo_seen", code)
@@ -1022,8 +1034,8 @@ async def promo_loop():
                     response_text = response.text or ""
                     codes = parse_promo_codes(response_text)
                     seen = {
-                        x.strip() for x in
-                        config.get("promo_seen", "").split(",") if x.strip()
+                        x.strip().upper() for x in
+                        config.get("promo_seen", "EVO,437,EVO2,DEV2").split(",") if x.strip()
                     }
 
                     logger.info(
@@ -2901,11 +2913,13 @@ async def register_handlers():
     async def promoseen_handler(event):
         match = event.pattern_match
         action = match.group(1)
-        code = match.group(2)
+        code = (match.group(2) or "").upper()
         seen = {
-            x.strip() for x in config.get("promo_seen", "").split(",")
+            x.strip().upper() for x in config.get("promo_seen", "EVO,437,EVO2,DEV2").split(",")
             if x.strip()
         }
+        if not config.get("promo_seen"):
+            seen.update({"EVO", "437", "EVO2", "DEV2"})
 
         if not action or not code:
             lines = ["📋 <b>promo_seen:</b>"]
@@ -3405,6 +3419,8 @@ async def register_handlers():
     async def repeat_handler(event):
         raw = (event.pattern_match.group(1) or "").strip()
         tokens = raw.split()
+        random_delay = any(token.lower() == "random" for token in tokens)
+        tokens = [token for token in tokens if token.lower() != "random"]
         text = entities = source = None
 
         if len(tokens) >= 3:
@@ -3422,7 +3438,9 @@ async def register_handlers():
                 event,
                 "<b>Формат 1:</b> <code>.repeat текст количество интервал_в_минутах</code>\n"
                 "<b>Формат 2:</b> reply на сообщение + "
-                "<code>.repeat количество интервал_в_минутах</code>"
+                "<code>.repeat количество интервал_в_минутах</code>\n"
+                "Добавьте <code>random</code>, чтобы после каждого интервала "
+                "добавлялось случайное ожидание от 0 до 30 минут."
             )
 
         if not count_str.isdigit() or int(count_str) <= 0:
@@ -3450,11 +3468,15 @@ async def register_handlers():
         active_tasks[chat_id] = {"stop_event": stop_event}
         interval_label = format_duration_seconds(round(interval_seconds))
         await event.delete()
+        repeat_preview = text if source is None else (source.raw_text or "[медиа-сообщение]")
+        repeat_preview = (repeat_preview or "[медиа-сообщение]").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        random_label = "\nСлучайная добавка: <code>0–30 минут</code> после каждого интервала." if random_delay else ""
         await send_repeat_status(
             chat_id,
             f"🚀 <b>Повтор запущен.</b>\n"
             f"Количество: <code>{count}</code>\n"
-            f"Интервал: <code>{interval_label}</code>\n"
+            f"Интервал: <code>{interval_label}</code>{random_label}\n"
+            f"Текст: <code>{repeat_preview}</code>\n"
             "Первое сообщение будет отправлено после ожидания интервала.\n"
             "Остановить: <code>.stoprepeat</code>",
         )
@@ -3463,9 +3485,12 @@ async def register_handlers():
         try:
             for _ in range(count):
                 # The interval is also applied before the first send, including a single repeat.
-                if interval_seconds > 0:
+                wait_seconds = interval_seconds
+                if random_delay:
+                    wait_seconds += random.uniform(0, 30 * 60)
+                if wait_seconds > 0:
                     try:
-                        await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                        await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
                     except asyncio.TimeoutError:
                         pass
                 if stop_event.is_set():
